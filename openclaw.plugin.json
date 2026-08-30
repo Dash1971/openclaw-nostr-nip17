@@ -1,0 +1,17 @@
+{
+  "id": "nostr-nip17",
+  "name": "Nostr NIP-17",
+  "description": "OpenClaw Nostr channel plugin for NIP-17 gift-wrapped private messages.",
+  "activation": {
+    "onStartup": false
+  },
+  "channels": ["nostr"],
+  "channelEnvVars": {
+    "nostr": ["NOSTR_PRIVATE_KEY"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "name": "@dash1971/openclaw-nostr-nip17",
+  "version": "0.1.0",
+  "description": "OpenClaw Nostr channel plugin using NIP-17 gift-wrapped private DMs.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Dash1971/openclaw-nostr-nip17"
+  },
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run src/nip17.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "nostr-tools": "2.23.9",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "openclaw": "2026.7.1-2",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.7.1"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "openclaw": {
+    "extensions": ["./index.ts"],
+    "setupEntry": "./setup-entry.ts",
+    "channel": {
+      "id": "nostr",
+      "label": "Nostr",
+      "selectionLabel": "Nostr (NIP-17 DMs)",
+      "docsPath": "/channels/nostr",
+      "docsLabel": "nostr",
+      "blurb": "Decentralized private messages via NIP-17.",
+      "order": 55,
+      "quickstartAllowFrom": true,
+      "cliAddOptions": [
+        {"flags": "--private-key <key>", "description": "Nostr private key (nsec... or hex)"},
+        {"flags": "--relay-urls <list>", "description": "Nostr relay URLs (comma-separated)"}
+      ]
+    },
+    "install": {
+      "npmSpec": "@dash1971/openclaw-nostr-nip17",
+      "defaultChoice": "npm",
+      "minHostVersion": ">=2026.7.1"
+    }
+  }
+}
