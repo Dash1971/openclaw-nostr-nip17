@@ -31,7 +31,7 @@ function resolveNostrAccount(params: { cfg: unknown; accountId: string }) {
 }
 
 export default defineBundledChannelEntry({
-  id: "nostr-nip17",
+  id: "nostr",
   name: "Nostr",
   description: "Nostr private DM channel plugin via NIP-17",
   importMetaUrl: import.meta.url,
