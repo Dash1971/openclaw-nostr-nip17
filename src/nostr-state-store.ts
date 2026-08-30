@@ -1,6 +1,8 @@
 // Nostr plugin module implements nostr state store behavior.
 import { getNostrRuntime } from "./runtime.js";
 import { normalizeNostrStateAccountId } from "./state-account-id.js";
+import { readTextFileIfExists, writeJsonFileSecure } from "openclaw/plugin-sdk/security-runtime";
+import path from "node:path";
 
 const STORE_VERSION = 2;
 const PROFILE_STATE_VERSION = 1;
@@ -26,30 +28,40 @@ type NostrProfileState = {
   lastPublishResults: Record<string, "ok" | "failed" | "timeout"> | null;
 };
 
-function openNostrBusStateStore(env?: NodeJS.ProcessEnv) {
-  return getNostrRuntime().state.openKeyedStore<NostrBusState>({
-    namespace: "bus-state",
-    maxEntries: 256,
-    ...(env ? { env } : {}),
-  });
+function resolveStorePath(namespace: string, accountId: string, env?: NodeJS.ProcessEnv): string {
+  const stateDir = getNostrRuntime().state.resolveStateDir(env);
+  return path.join(stateDir, "plugins", "nostr", namespace, `${accountId}.json`);
 }
 
-function openNostrProfileStateStore(env?: NodeJS.ProcessEnv) {
-  return getNostrRuntime().state.openKeyedStore<NostrProfileState>({
-    namespace: "profile-state",
-    maxEntries: 256,
-    ...(env ? { env } : {}),
-  });
+function readStateFile<T>(namespace: string, accountId: string, env?: NodeJS.ProcessEnv): T | null {
+  const raw = readTextFileIfExists(resolveStorePath(namespace, accountId, env));
+  if (raw === null) {
+    return null;
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+function writeStateFile<T>(
+  namespace: string,
+  accountId: string,
+  payload: T,
+  env?: NodeJS.ProcessEnv,
+): void {
+  writeJsonFileSecure(resolveStorePath(namespace, accountId, env), payload);
 }
 
 export async function readNostrBusState(params: {
   accountId?: string;
   env?: NodeJS.ProcessEnv;
 }): Promise<NostrBusState | null> {
-  return (
-    (await openNostrBusStateStore(params.env).lookup(
-      normalizeNostrStateAccountId(params.accountId),
-    )) ?? null
+  return readStateFile<NostrBusState>(
+    "bus-state",
+    normalizeNostrStateAccountId(params.accountId),
+    params.env,
   );
 }
 
@@ -66,9 +78,11 @@ export async function writeNostrBusState(params: {
     gatewayStartedAt: params.gatewayStartedAt,
     recentEventIds: (params.recentEventIds ?? []).filter((x): x is string => typeof x === "string"),
   };
-  await openNostrBusStateStore(params.env).register(
+  writeStateFile(
+    "bus-state",
     normalizeNostrStateAccountId(params.accountId),
     payload,
+    params.env,
   );
 }
 
@@ -104,10 +118,10 @@ export async function readNostrProfileState(params: {
   accountId?: string;
   env?: NodeJS.ProcessEnv;
 }): Promise<NostrProfileState | null> {
-  return (
-    (await openNostrProfileStateStore(params.env).lookup(
-      normalizeNostrStateAccountId(params.accountId),
-    )) ?? null
+  return readStateFile<NostrProfileState>(
+    "profile-state",
+    normalizeNostrStateAccountId(params.accountId),
+    params.env,
   );
 }
 
@@ -124,8 +138,10 @@ export async function writeNostrProfileState(params: {
     lastPublishedEventId: params.lastPublishedEventId,
     lastPublishResults: params.lastPublishResults,
   };
-  await openNostrProfileStateStore(params.env).register(
+  writeStateFile(
+    "profile-state",
     normalizeNostrStateAccountId(params.accountId),
     payload,
+    params.env,
   );
 }

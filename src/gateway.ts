@@ -14,6 +14,7 @@ import { normalizePubkey } from "./nostr-key-utils.js";
 import { getNostrRuntime } from "./runtime.js";
 import { resolveDefaultNostrAccountId, type ResolvedNostrAccount } from "./types.js";
 import { createTotpAuthenticator } from "./totp-auth.js";
+import { buildNostrInboundAuthContext } from "./inbound-auth-context.js";
 
 type NostrGatewayStart = NonNullable<
   NonNullable<ChannelPlugin<ResolvedNostrAccount>["gateway"]>["startAccount"]
@@ -180,6 +181,10 @@ export const startNostrGatewayAccount: NostrGatewayStart = async (ctx) => {
 
           const { dispatchInboundDirectDmWithRuntime } =
             await import("./inbound-direct-dm-runtime.js");
+          const authContext = buildNostrInboundAuthContext({
+            totpConfigured: Boolean(totp),
+            senderPubkey,
+          });
           await dispatchInboundDirectDmWithRuntime({
             cfg: ctx.cfg,
             runtime,
@@ -195,6 +200,8 @@ export const startNostrGatewayAccount: NostrGatewayStart = async (ctx) => {
             recipientAddress: `nostr:${account.publicKey}`,
             conversationLabel: senderPubkey,
             rawBody: text,
+            bodyForAgent: `${authContext.bodyPrefix}\n\n${text}`,
+            extraContext: authContext.extraContext,
             messageId: meta.eventId,
             timestamp: meta.createdAt * 1000,
             commandAuthorized: resolvedAccess.commandAccess.requested
