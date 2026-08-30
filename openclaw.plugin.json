@@ -9,6 +9,42 @@
   "channelEnvVars": {
     "nostr": ["NOSTR_PRIVATE_KEY"]
   },
+  "channelConfigs": {
+    "nostr": {
+      "label": "Nostr NIP-17",
+      "description": "Private direct messages using NIP-17 gift wraps.",
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {"type": "string"},
+          "defaultAccount": {"type": "string"},
+          "enabled": {"type": "boolean"},
+          "privateKey": {
+            "anyOf": [
+              {"type": "string"},
+              {
+                "type": "object",
+                "required": ["source", "provider", "id"],
+                "additionalProperties": false,
+                "properties": {
+                  "source": {"type": "string", "enum": ["env", "file", "exec"]},
+                  "provider": {"type": "string"},
+                  "id": {"type": "string"}
+                }
+              }
+            ]
+          },
+          "relays": {"type": "array", "items": {"type": "string"}},
+          "dmPolicy": {"type": "string", "enum": ["pairing", "allowlist", "open", "disabled"]},
+          "allowFrom": {"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "number"}]}},
+          "profile": {"type": "object"},
+          "markdown": {"type": "object"}
+        }
+      }
+    }
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
