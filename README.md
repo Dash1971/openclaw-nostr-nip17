@@ -45,6 +45,19 @@ Configure `channels.nostr` as documented by OpenClaw. Keep the private key in an
 
 Restart the gateway after changing plugins or secret environment variables.
 
+### Optional TOTP step-up authentication
+
+Set `channels.nostr.totpSecret` to a SecretRef containing an RFC 4648 base32 TOTP seed.
+When configured, allowlisted senders must send `AUTH 123456` before any message reaches the
+agent or command dispatcher. Authentication sessions default to five minutes and can be set
+from 60 to 3600 seconds with `channels.nostr.totpSessionSeconds`.
+
+TOTP codes are consumed before agent dispatch, are never intentionally logged, cannot be reused
+for a second authentication in the same time step, and lock for five minutes after five failures.
+Keep the TOTP seed separate from the Nostr signing key. TOTP reduces the impact of a stolen Nostr
+key but does not restore message confidentiality or prevent a live attacker from sharing an
+already-authenticated session.
+
 ## Security notes
 
 - NIP-17 hides the sender and message type from public relay observers, but it does not provide forward secrecy or post-compromise security.

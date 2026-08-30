@@ -65,6 +65,8 @@ const nostrConfigAdapter = createTopLevelChannelConfigAdapter<ResolvedNostrAccou
     "name",
     "defaultAccount",
     "privateKey",
+    "totpSecret",
+    "totpSessionSeconds",
     "relays",
     "dmPolicy",
     "allowFrom",

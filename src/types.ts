@@ -20,6 +20,8 @@ interface NostrAccountConfig {
   name?: string;
   defaultAccount?: string;
   privateKey?: SecretInput;
+  totpSecret?: SecretInput;
+  totpSessionSeconds?: number;
   relays?: string[];
   dmPolicy?: "pairing" | "allowlist" | "open" | "disabled";
   allowFrom?: Array<string | number>;
@@ -32,6 +34,8 @@ export interface ResolvedNostrAccount {
   enabled: boolean;
   configured: boolean;
   privateKey: string;
+  totpSecret: string;
+  totpSessionSeconds: number;
   publicKey: string;
   relays: string[];
   profile?: NostrProfile;
@@ -85,12 +89,13 @@ export function resolveNostrAccount(opts: {
 
   const baseEnabled = nostrCfg?.enabled !== false;
   const privateKey = normalizeSecretInputString(nostrCfg?.privateKey) ?? "";
-  const configured = Boolean(privateKey);
+  let configured = false;
 
   let publicKey = "";
   if (privateKey) {
     try {
       publicKey = getPublicKeyFromPrivate(privateKey);
+      configured = true;
     } catch {
       // Invalid key - leave publicKey empty, configured will indicate issues
     }
@@ -102,6 +107,9 @@ export function resolveNostrAccount(opts: {
     enabled: baseEnabled,
     configured,
     privateKey,
+    totpSecret:
+      normalizeSecretInputString(nostrCfg?.totpSecret) ?? process.env.NOSTR_TOTP_SECRET?.trim() ?? "",
+    totpSessionSeconds: nostrCfg?.totpSessionSeconds ?? 300,
     publicKey,
     relays: nostrCfg?.relays ?? DEFAULT_RELAYS,
     profile: nostrCfg?.profile,
@@ -109,6 +117,8 @@ export function resolveNostrAccount(opts: {
       enabled: nostrCfg?.enabled,
       name: nostrCfg?.name,
       privateKey: nostrCfg?.privateKey,
+      totpSecret: nostrCfg?.totpSecret,
+      totpSessionSeconds: nostrCfg?.totpSessionSeconds,
       relays: nostrCfg?.relays,
       dmPolicy: nostrCfg?.dmPolicy,
       allowFrom: nostrCfg?.allowFrom,

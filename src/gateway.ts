@@ -13,6 +13,7 @@ import { startNostrBus, type NostrBusHandle } from "./nostr-bus.js";
 import { normalizePubkey } from "./nostr-key-utils.js";
 import { getNostrRuntime } from "./runtime.js";
 import { resolveDefaultNostrAccountId, type ResolvedNostrAccount } from "./types.js";
+import { createTotpAuthenticator } from "./totp-auth.js";
 
 type NostrGatewayStart = NonNullable<
   NonNullable<ChannelPlugin<ResolvedNostrAccount>["gateway"]>["startAccount"]
@@ -85,6 +86,12 @@ export const startNostrGatewayAccount: NostrGatewayStart = async (ctx) => {
   }
 
   const runtime = getNostrRuntime();
+  const totp = account.totpSecret
+    ? createTotpAuthenticator({
+        secret: account.totpSecret,
+        sessionSeconds: account.totpSessionSeconds,
+      })
+    : null;
   const pairing = createChannelPairingController({
     core: runtime,
     channel: "nostr",
@@ -161,6 +168,14 @@ export const startNostrGatewayAccount: NostrGatewayStart = async (ctx) => {
               `[${account.accountId}] dropping Nostr DM after preflight drift (${senderPubkey}, ${resolvedAccess.senderAccess.reasonCode})`,
             );
             return;
+          }
+
+          if (totp) {
+            const authentication = totp.authenticate(senderPubkey, text);
+            if (authentication.decision === "consume") {
+              await reply(authentication.reply);
+              return;
+            }
           }
 
           const { dispatchInboundDirectDmWithRuntime } =

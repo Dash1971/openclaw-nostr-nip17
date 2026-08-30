@@ -4,6 +4,7 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { DEFAULT_ACCOUNT_ID } from "openclaw/plugin-sdk/routing";
 import { patchTopLevelChannelConfigSection, splitSetupEntries } from "openclaw/plugin-sdk/setup";
 import { uniqueStrings } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { isBlockedHostnameOrIp } from "openclaw/plugin-sdk/ssrf-runtime";
 
 const channel = "nostr" as const;
 
@@ -19,13 +20,26 @@ export function parseRelayUrls(raw: string): { relays: string[]; error?: string 
   for (const entry of splitSetupEntries(raw)) {
     try {
       const parsed = new URL(entry);
-      if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
-        return { relays: [], error: `Relay must use ws:// or wss:// (${entry})` };
+      if (
+        parsed.protocol !== "wss:" ||
+        parsed.username ||
+        parsed.password ||
+        parsed.hash ||
+        !parsed.hostname ||
+        isBlockedHostnameOrIp(parsed.hostname.trim().toLowerCase())
+      ) {
+        return {
+          relays: [],
+          error: `Relay must be a credential-free wss:// URL without a fragment (${entry})`,
+        };
       }
     } catch {
       return { relays: [], error: `Invalid relay URL: ${entry}` };
     }
     relays.push(entry);
+    if (relays.length > 10) {
+      return { relays: [], error: "A maximum of 10 relays may be configured" };
+    }
   }
   return { relays: uniqueStrings(relays) };
 }

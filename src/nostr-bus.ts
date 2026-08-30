@@ -473,6 +473,10 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
         markSeen();
         metrics.emit(metric);
       };
+      const rejectVerifiedAndPersist = (metric: Parameters<typeof metrics.emit>[0]) => {
+        rejectAndMarkSeen(metric);
+        scheduleStatePersist(event.created_at, event.id);
+      };
 
       // Skip events older than our `since` (relay may ignore filter)
       if (event.created_at < since) {
@@ -551,18 +555,19 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
         message = unwrapNip17Message(event, sk, pk);
         metrics.emit("decrypt.success");
       } catch (err) {
-        markSeen();
+        rejectVerifiedAndPersist("event.rejected.decrypt_failed");
         metrics.emit("decrypt.failure");
-        metrics.emit("event.rejected.decrypt_failed");
         onError?.(err as Error, `decrypt gift wrap ${event.id}`);
         return;
       }
 
       if (message.senderPubkey === pk) {
-        rejectAndMarkSeen("event.rejected.self_message");
+        rejectVerifiedAndPersist("event.rejected.self_message");
         return;
       }
       if (rejectIfVerifiedSenderRateLimited(message.senderPubkey)) {
+        markSeen();
+        scheduleStatePersist(event.created_at, event.id);
         return;
       }
 
@@ -588,6 +593,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
         });
         if (decision !== "allow") {
           markSeen();
+          scheduleStatePersist(event.created_at, event.id);
           return;
         }
       }
@@ -595,6 +601,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
       if (Buffer.byteLength(message.content, "utf8") > guardPolicy.maxPlaintextBytes) {
         markSeen();
         metrics.emit("event.rejected.oversized_plaintext");
+        scheduleStatePersist(event.created_at, event.id);
         return;
       }
 
