@@ -4,7 +4,7 @@ import { createPluginRuntimeStore } from "openclaw/plugin-sdk/runtime-store";
 
 const { setRuntime: setNostrRuntime, getRuntime: getNostrRuntime } =
   createPluginRuntimeStore<PluginRuntime>({
-    pluginId: "nostr-nip17",
+    pluginId: "nostr",
     errorMessage: "Nostr runtime not initialized",
   });
 export { getNostrRuntime, setNostrRuntime };

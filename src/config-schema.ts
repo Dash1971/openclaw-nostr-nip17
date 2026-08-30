@@ -105,8 +105,14 @@ export const NostrConfigSchema = z.object({
   /** Private key in hex or nsec bech32 format */
   privateKey: buildSecretInputSchema().optional(),
 
+  /** Owner-only local file containing the private key. */
+  privateKeyFile: z.string().min(1).optional(),
+
   /** Optional second-factor seed. When set, inbound DMs require TOTP authentication. */
   totpSecret: buildSecretInputSchema().optional(),
+
+  /** Owner-only local file containing the TOTP seed. */
+  totpSecretFile: z.string().min(1).optional(),
 
   /** Duration of an authenticated Nostr session. */
   totpSessionSeconds: z.number().int().min(60).max(3600).default(300),

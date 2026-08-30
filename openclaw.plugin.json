@@ -36,6 +36,7 @@
               }
             ]
           },
+          "privateKeyFile": {"type": "string", "minLength": 1},
           "totpSecret": {
             "anyOf": [
               {"type": "string"},
@@ -51,6 +52,7 @@
               }
             ]
           },
+          "totpSecretFile": {"type": "string", "minLength": 1},
           "totpSessionSeconds": {"type": "integer", "minimum": 60, "maximum": 3600},
           "relays": {
             "type": "array",

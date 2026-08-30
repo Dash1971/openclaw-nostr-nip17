@@ -11,6 +11,8 @@ import {
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { normalizeSecretInputString, type SecretInput } from "openclaw/plugin-sdk/secret-input";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { lstatSync, readFileSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import type { NostrProfile } from "./config-schema.js";
 import { DEFAULT_RELAYS } from "./default-relays.js";
 import { getPublicKeyFromPrivate } from "./nostr-key-utils.js";
@@ -20,12 +22,33 @@ interface NostrAccountConfig {
   name?: string;
   defaultAccount?: string;
   privateKey?: SecretInput;
+  privateKeyFile?: string;
   totpSecret?: SecretInput;
+  totpSecretFile?: string;
   totpSessionSeconds?: number;
   relays?: string[];
   dmPolicy?: "pairing" | "allowlist" | "open" | "disabled";
   allowFrom?: Array<string | number>;
   profile?: NostrProfile;
+}
+
+function readProtectedSecretFile(path: string | undefined): string | undefined {
+  const normalized = path?.trim();
+  if (!normalized) return undefined;
+  if (!isAbsolute(normalized)) throw new Error("Nostr secret file path must be absolute");
+  const stat = lstatSync(normalized);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error(`Nostr secret path must be a regular non-symlink file: ${normalized}`);
+  }
+  if ((stat.mode & 0o077) !== 0) {
+    throw new Error(`Nostr secret file must not be accessible by group or others: ${normalized}`);
+  }
+  if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
+    throw new Error(`Nostr secret file must be owned by the OpenClaw user: ${normalized}`);
+  }
+  const value = readFileSync(normalized, "utf8").trim();
+  if (!value) throw new Error(`Nostr secret file is empty: ${normalized}`);
+  return value;
 }
 
 export interface ResolvedNostrAccount {
@@ -56,7 +79,10 @@ export function listNostrAccountIds(cfg: OpenClawConfig): string[] {
   const nostrCfg = (cfg.channels as Record<string, unknown> | undefined)?.nostr as
     | NostrAccountConfig
     | undefined;
-  const privateKey = normalizeSecretInputString(nostrCfg?.privateKey);
+  const privateKey =
+    normalizeSecretInputString(nostrCfg?.privateKey) ??
+    readProtectedSecretFile(nostrCfg?.privateKeyFile) ??
+    process.env.NOSTR_PRIVATE_KEY?.trim();
   return listCombinedAccountIds({
     configuredAccountIds: [],
     implicitAccountId: privateKey
@@ -88,7 +114,11 @@ export function resolveNostrAccount(opts: {
     | undefined;
 
   const baseEnabled = nostrCfg?.enabled !== false;
-  const privateKey = normalizeSecretInputString(nostrCfg?.privateKey) ?? "";
+  const privateKey =
+    normalizeSecretInputString(nostrCfg?.privateKey) ??
+    readProtectedSecretFile(nostrCfg?.privateKeyFile) ??
+    process.env.NOSTR_PRIVATE_KEY?.trim() ??
+    "";
   let configured = false;
 
   let publicKey = "";
@@ -108,7 +138,10 @@ export function resolveNostrAccount(opts: {
     configured,
     privateKey,
     totpSecret:
-      normalizeSecretInputString(nostrCfg?.totpSecret) ?? process.env.NOSTR_TOTP_SECRET?.trim() ?? "",
+      normalizeSecretInputString(nostrCfg?.totpSecret) ??
+      readProtectedSecretFile(nostrCfg?.totpSecretFile) ??
+      process.env.NOSTR_TOTP_SECRET?.trim() ??
+      "",
     totpSessionSeconds: nostrCfg?.totpSessionSeconds ?? 300,
     publicKey,
     relays: nostrCfg?.relays ?? DEFAULT_RELAYS,
@@ -117,7 +150,9 @@ export function resolveNostrAccount(opts: {
       enabled: nostrCfg?.enabled,
       name: nostrCfg?.name,
       privateKey: nostrCfg?.privateKey,
+      privateKeyFile: nostrCfg?.privateKeyFile,
       totpSecret: nostrCfg?.totpSecret,
+      totpSecretFile: nostrCfg?.totpSecretFile,
       totpSessionSeconds: nostrCfg?.totpSessionSeconds,
       relays: nostrCfg?.relays,
       dmPolicy: nostrCfg?.dmPolicy,
