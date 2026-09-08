@@ -35,6 +35,7 @@ import {
   createSubscriptionSupervisor,
   type SubscriptionHealth,
 } from "./subscription-supervisor.js";
+import { createClaimedIdTracker } from "./claimed-id-tracker.js";
 import {
   createNip17Message,
   NIP17_GIFT_WRAP_KIND,
@@ -505,6 +506,10 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
     maxEntries: maxSeenEntries,
     ttlMs: seenTtlMs,
   });
+  const rumors = createClaimedIdTracker({
+    maxEntries: maxSeenEntries,
+    ttlMs: seenTtlMs,
+  });
 
   // Initialize circuit breakers and health tracker
   const circuitBreakers = new Map<string, CircuitBreaker>();
@@ -523,6 +528,9 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
   if (state?.recentEventIds?.length) {
     seen.seed(state.recentEventIds);
   }
+  if (state?.recentRumorIds?.length) {
+    rumors.seed(state.recentRumorIds);
+  }
 
   // Persist startup timestamp
   await writeNostrBusState({
@@ -530,18 +538,32 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
     lastProcessedAt: state?.lastProcessedAt ?? gatewayStartedAt,
     gatewayStartedAt,
     recentEventIds: state?.recentEventIds ?? [],
+    recentRumorIds: state?.recentRumorIds ?? [],
   });
 
   // Debounced state persistence
   let pendingWrite: ReturnType<typeof setTimeout> | undefined;
   let lastProcessedAt = state?.lastProcessedAt ?? gatewayStartedAt;
   let recentEventIds = (state?.recentEventIds ?? []).slice(-MAX_PERSISTED_EVENT_IDS);
+  let recentRumorIds = (state?.recentRumorIds ?? []).slice(-MAX_PERSISTED_EVENT_IDS);
 
-  function scheduleStatePersist(eventCreatedAt: number, eventId: string): void {
+  function scheduleStatePersist(
+    eventCreatedAt: number,
+    eventId: string,
+    rumorId?: string,
+  ): void {
     lastProcessedAt = Math.max(lastProcessedAt, eventCreatedAt);
     recentEventIds.push(eventId);
     if (recentEventIds.length > MAX_PERSISTED_EVENT_IDS) {
       recentEventIds = recentEventIds.slice(-MAX_PERSISTED_EVENT_IDS);
+    }
+    if (rumorId) {
+      if (!recentRumorIds.includes(rumorId)) {
+        recentRumorIds.push(rumorId);
+      }
+      if (recentRumorIds.length > MAX_PERSISTED_EVENT_IDS) {
+        recentRumorIds = recentRumorIds.slice(-MAX_PERSISTED_EVENT_IDS);
+      }
     }
 
     if (pendingWrite) {
@@ -553,6 +575,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
         lastProcessedAt,
         gatewayStartedAt,
         recentEventIds,
+        recentRumorIds,
       }).catch((err: unknown) => onError?.(err as Error, "persist state"));
     }, STATE_PERSIST_DEBOUNCE_MS);
   }
@@ -578,6 +601,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
 
   // Event handler
   async function handleEvent(event: Event): Promise<void> {
+    let claimedRumorId: string | null = null;
     try {
       metrics.emit("event.received");
 
@@ -684,13 +708,38 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
         return;
       }
 
+      const rumorClaim = rumors.claim(message.rumorId);
+      if (rumorClaim === "inflight") {
+        metrics.emit("event.duplicate");
+        return;
+      }
+      if (rumorClaim === "processed") {
+        markSeen();
+        scheduleStatePersist(event.created_at, event.id, message.rumorId);
+        metrics.emit("event.duplicate");
+        return;
+      }
+      claimedRumorId = message.rumorId;
+
+      const markRumorProcessed = () => {
+        if (!claimedRumorId) return;
+        rumors.complete(claimedRumorId);
+        metrics.emit("memory.seen_tracker_size", seen.size() + rumors.size());
+        claimedRumorId = null;
+      };
+      const markMessageProcessed = () => {
+        markSeen();
+        markRumorProcessed();
+        scheduleStatePersist(event.created_at, event.id, message.rumorId);
+      };
+
       if (message.senderPubkey === pk) {
-        rejectVerifiedAndPersist("event.rejected.self_message");
+        markMessageProcessed();
+        metrics.emit("event.rejected.self_message");
         return;
       }
       if (rejectIfVerifiedSenderRateLimited(message.senderPubkey)) {
-        markSeen();
-        scheduleStatePersist(event.created_at, event.id);
+        markMessageProcessed();
         return;
       }
 
@@ -715,16 +764,14 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
           reply: replyTo,
         });
         if (decision !== "allow") {
-          markSeen();
-          scheduleStatePersist(event.created_at, event.id);
+          markMessageProcessed();
           return;
         }
       }
 
       if (Buffer.byteLength(message.content, "utf8") > guardPolicy.maxPlaintextBytes) {
-        markSeen();
+        markMessageProcessed();
         metrics.emit("event.rejected.oversized_plaintext");
-        scheduleStatePersist(event.created_at, event.id);
         return;
       }
 
@@ -735,16 +782,18 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
       });
 
       // Only cache successful deliveries so handler failures can retry.
-      markSeen();
+      markMessageProcessed();
 
       // Mark as processed
       metrics.emit("event.processed");
 
       // Persist progress (debounced)
-      scheduleStatePersist(event.created_at, event.id);
     } catch (err) {
       onError?.(err as Error, `event ${event.id}`);
     } finally {
+      if (claimedRumorId) {
+        rumors.release(claimedRumorId);
+      }
       inflight.delete(event.id);
     }
   }
@@ -858,6 +907,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
       for (const subscription of subscriptions) subscription.stop();
       pool.close(relays);
       seen.stop();
+      rumors.stop();
       perSenderRateLimiter.clear();
       globalRateLimiter.clear();
       // Flush pending state write synchronously on close
@@ -868,6 +918,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
           lastProcessedAt,
           gatewayStartedAt,
           recentEventIds,
+          recentRumorIds,
         }).catch((err: unknown) => onError?.(err as Error, "persist state on close"));
       }
     },

@@ -31,6 +31,37 @@ const activeBuses = new Map<string, NostrBusHandle>();
 const metricsSnapshots = new Map<string, MetricsSnapshot>();
 const ACCESS_GROUP_PREFIX = "accessGroup:";
 
+export function buildNostrListenerStatus<
+  T extends { lastTransportActivityAt?: number | null },
+>(
+  previous: T,
+  account: { accountId: string; publicKey: string },
+  health: NostrBusHealth,
+) {
+  const connected = health.connectedRelays > 0;
+  return {
+    ...previous,
+    accountId: account.accountId,
+    publicKey: account.publicKey,
+    running: health.state !== "stopped",
+    connected,
+    statusState: health.state,
+    healthState: health.state,
+    reconnectAttempts: health.reconnectAttempts,
+    lastConnectedAt: health.lastConnectedAt,
+    lastDisconnect: health.lastDisconnectedAt
+      ? { at: health.lastDisconnectedAt, error: health.lastError ?? undefined }
+      : null,
+    lastError: health.lastError,
+    lastInboundAt: health.lastEventAt,
+    lastTransportActivityAt:
+      health.lastEventAt ??
+      health.lastEoseAt ??
+      health.lastConnectedAt ??
+      previous.lastTransportActivityAt,
+  };
+}
+
 function parseNostrAccessGroupAllowFromEntry(entry: string): string | null {
   const trimmed = entry.trim();
   if (!trimmed.startsWith(ACCESS_GROUP_PREFIX)) {
@@ -124,25 +155,7 @@ export const startNostrGatewayAccount: NostrGatewayStart = async (ctx) => {
 
   const updateListenerStatus = (health: NostrBusHealth) => {
     const previous = ctx.getStatus();
-    const connected = health.state === "healthy";
-    ctx.setStatus({
-      ...previous,
-      accountId: account.accountId,
-      publicKey: account.publicKey,
-      running: health.state !== "stopped",
-      connected,
-      statusState: health.state,
-      healthState: connected ? "healthy" : health.state,
-      reconnectAttempts: health.reconnectAttempts,
-      lastConnectedAt: health.lastConnectedAt,
-      lastDisconnect: health.lastDisconnectedAt
-        ? { at: health.lastDisconnectedAt, error: health.lastError ?? undefined }
-        : null,
-      lastError: health.lastError,
-      lastInboundAt: health.lastEventAt,
-      lastTransportActivityAt:
-        health.lastEventAt ?? health.lastEoseAt ?? health.lastConnectedAt ?? previous.lastTransportActivityAt,
-    });
+    ctx.setStatus(buildNostrListenerStatus(previous, account, health));
   };
 
   const authorizeSender = async (input: {

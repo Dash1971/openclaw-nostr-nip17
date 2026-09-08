@@ -4,17 +4,19 @@ import { normalizeNostrStateAccountId } from "./state-account-id.js";
 import { readTextFileIfExists, writeJsonFileSecure } from "openclaw/plugin-sdk/security-runtime";
 import path from "node:path";
 
-const STORE_VERSION = 2;
+const STORE_VERSION = 3;
 const PROFILE_STATE_VERSION = 1;
 
 type NostrBusState = {
-  version: 2;
+  version: 2 | 3;
   /** Unix timestamp (seconds) of the last processed event */
   lastProcessedAt: number | null;
   /** Gateway startup timestamp (seconds) - events before this are old */
   gatewayStartedAt: number | null;
   /** Recent processed event IDs for overlap dedupe across restarts */
   recentEventIds: string[];
+  /** Recent authenticated rumor IDs for dedupe across gift wraps and restarts */
+  recentRumorIds?: string[];
 };
 
 /** Profile publish state (separate from bus state) */
@@ -70,6 +72,7 @@ export async function writeNostrBusState(params: {
   lastProcessedAt: number;
   gatewayStartedAt: number;
   recentEventIds?: string[];
+  recentRumorIds?: string[];
   env?: NodeJS.ProcessEnv;
 }): Promise<void> {
   const payload: NostrBusState = {
@@ -77,6 +80,9 @@ export async function writeNostrBusState(params: {
     lastProcessedAt: params.lastProcessedAt,
     gatewayStartedAt: params.gatewayStartedAt,
     recentEventIds: (params.recentEventIds ?? []).filter((x): x is string => typeof x === "string"),
+    recentRumorIds: (params.recentRumorIds ?? []).filter(
+      (x): x is string => typeof x === "string",
+    ),
   };
   writeStateFile(
     "bus-state",

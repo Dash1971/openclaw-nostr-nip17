@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { aggregateSubscriptionHealth } from "./nostr-bus.js";
+import { buildNostrListenerStatus } from "./gateway.js";
 import type { SubscriptionHealth } from "./subscription-supervisor.js";
 
 const health = (state: SubscriptionHealth["state"], overrides: Partial<SubscriptionHealth> = {}) => ({
@@ -33,6 +34,33 @@ describe("aggregate Nostr bus health", () => {
     expect(aggregateSubscriptionHealth(relays, states)).toMatchObject({
       state: "unhealthy",
       connectedRelays: 0,
+    });
+  });
+
+  it("keeps partial relay coverage connected while preserving degraded health", () => {
+    const status = buildNostrListenerStatus(
+      { lastTransportActivityAt: 5 },
+      { accountId: "default", publicKey: "public-key" },
+      {
+        state: "degraded",
+        connectedRelays: 1,
+        totalRelays: 3,
+        reconnectAttempts: 2,
+        lastConnectedAt: 10,
+        lastDisconnectedAt: 11,
+        lastEventAt: null,
+        lastEoseAt: 10,
+        lastError: "two relays unavailable",
+        relays: {},
+      },
+    );
+
+    expect(status).toMatchObject({
+      running: true,
+      connected: true,
+      statusState: "degraded",
+      healthState: "degraded",
+      lastTransportActivityAt: 10,
     });
   });
 });
