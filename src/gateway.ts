@@ -15,6 +15,7 @@ import { getNostrRuntime } from "./runtime.js";
 import { resolveDefaultNostrAccountId, type ResolvedNostrAccount } from "./types.js";
 import { createTotpAuthenticator } from "./totp-auth.js";
 import { buildNostrInboundAuthContext } from "./inbound-auth-context.js";
+import type { NostrBusHealth } from "./nostr-bus.js";
 
 type NostrGatewayStart = NonNullable<
   NonNullable<ChannelPlugin<ResolvedNostrAccount>["gateway"]>["startAccount"]
@@ -120,6 +121,29 @@ export const startNostrGatewayAccount: NostrGatewayStart = async (ctx) => {
     });
 
   let busHandle: NostrBusHandle | null = null;
+
+  const updateListenerStatus = (health: NostrBusHealth) => {
+    const previous = ctx.getStatus();
+    const connected = health.state === "healthy";
+    ctx.setStatus({
+      ...previous,
+      accountId: account.accountId,
+      publicKey: account.publicKey,
+      running: health.state !== "stopped",
+      connected,
+      statusState: health.state,
+      healthState: connected ? "healthy" : health.state,
+      reconnectAttempts: health.reconnectAttempts,
+      lastConnectedAt: health.lastConnectedAt,
+      lastDisconnect: health.lastDisconnectedAt
+        ? { at: health.lastDisconnectedAt, error: health.lastError ?? undefined }
+        : null,
+      lastError: health.lastError,
+      lastInboundAt: health.lastEventAt,
+      lastTransportActivityAt:
+        health.lastEventAt ?? health.lastEoseAt ?? health.lastConnectedAt ?? previous.lastTransportActivityAt,
+    });
+  };
 
   const authorizeSender = async (input: {
     senderId: string;
@@ -246,6 +270,7 @@ export const startNostrGatewayAccount: NostrGatewayStart = async (ctx) => {
         onEose: (relays) => {
           ctx.log?.debug?.(`[${account.accountId}] EOSE received from relays: ${relays}`);
         },
+        onHealth: updateListenerStatus,
         onMetric: (event: MetricEvent) => {
           if (event.name.startsWith("event.rejected.")) {
             ctx.log?.debug?.(

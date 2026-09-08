@@ -32,6 +32,10 @@ import {
 } from "./nostr-state-store.js";
 import { createSeenTracker, type SeenTracker } from "./seen-tracker.js";
 import {
+  createSubscriptionSupervisor,
+  type SubscriptionHealth,
+} from "./subscription-supervisor.js";
+import {
   createNip17Message,
   NIP17_GIFT_WRAP_KIND,
   NIP17_INBOX_RELAYS_KIND,
@@ -54,6 +58,65 @@ const CIRCUIT_BREAKER_RESET_MS = 30000; // 30 seconds before half-open
 
 // Health tracker configuration
 const HEALTH_WINDOW_MS = 60000; // 1 minute window for health stats
+
+export interface NostrBusHealth {
+  state: "connecting" | "healthy" | "degraded" | "unhealthy" | "stopped";
+  connectedRelays: number;
+  totalRelays: number;
+  reconnectAttempts: number;
+  lastConnectedAt: number | null;
+  lastDisconnectedAt: number | null;
+  lastEventAt: number | null;
+  lastEoseAt: number | null;
+  lastError: string | null;
+  relays: Record<string, SubscriptionHealth>;
+}
+
+export function aggregateSubscriptionHealth(
+  relays: string[],
+  relayHealth: ReadonlyMap<string, SubscriptionHealth>,
+): NostrBusHealth {
+  const states = relays.map((relay) => relayHealth.get(relay)).filter(Boolean) as SubscriptionHealth[];
+  const connectedRelays = states.filter((health) => health.state === "healthy").length;
+  const stoppedRelays = states.filter((health) => health.state === "stopped").length;
+  const state: NostrBusHealth["state"] =
+    stoppedRelays === relays.length
+      ? "stopped"
+      : connectedRelays === relays.length
+        ? "healthy"
+        : connectedRelays > 0
+          ? "degraded"
+          : states.some((health) => health.state === "degraded")
+            ? "unhealthy"
+            : "connecting";
+  const latest = (field: keyof SubscriptionHealth): number | null => {
+    const values = states
+      .map((health) => health[field])
+      .filter((value): value is number => typeof value === "number");
+    return values.length ? Math.max(...values) : null;
+  };
+  return {
+    state,
+    connectedRelays,
+    totalRelays: relays.length,
+    reconnectAttempts: states.reduce((sum, health) => sum + health.reconnectAttempts, 0),
+    lastConnectedAt: latest("lastConnectedAt"),
+    lastDisconnectedAt: latest("lastDisconnectedAt"),
+    lastEventAt: latest("lastEventAt"),
+    lastEoseAt: latest("lastEoseAt"),
+    lastError:
+      states
+        .map((health) => health.lastError)
+        .filter((error): error is string => Boolean(error))
+        .join("; ") || null,
+    relays: Object.fromEntries(
+      relays.flatMap((relay) => {
+        const health = relayHealth.get(relay);
+        return health ? [[relay, { ...health }]] : [];
+      }),
+    ),
+  };
+}
 
 type RelayPublisher = {
   publish: (
@@ -78,6 +141,29 @@ export async function publishEventWithNip42Auth(
     throw new Error(`Failed to create publish promise for relay ${relay}`);
   }
   await publishPromises[0];
+}
+
+export async function publishEventToAllRelays(
+  pool: RelayPublisher,
+  relays: string[],
+  event: Event,
+  sk: Uint8Array,
+): Promise<Array<{ relay: string; durationMs: number; error?: Error }>> {
+  return await Promise.all(
+    relays.map(async (relay) => {
+      const startedAt = Date.now();
+      try {
+        await publishEventWithNip42Auth(pool, relay, event, sk);
+        return { relay, durationMs: Date.now() - startedAt };
+      } catch (error) {
+        return {
+          relay,
+          durationMs: Date.now() - startedAt,
+          error: error instanceof Error ? error : new Error(String(error)),
+        };
+      }
+    }),
+  );
 }
 
 // ============================================================================
@@ -115,6 +201,8 @@ interface NostrBusOptions {
   onEose?: (relay: string) => void;
   /** Called on each metric event (optional) */
   onMetric?: (event: MetricEvent) => void;
+  /** Called whenever listener health changes (optional) */
+  onHealth?: (health: NostrBusHealth) => void;
   /** Maximum entries in seen tracker (default: 100,000) */
   maxSeenEntries?: number;
   /** Seen tracker TTL in ms (default: 1 hour) */
@@ -186,6 +274,8 @@ export interface NostrBusHandle {
   sendDm: (toPubkey: string, text: string) => Promise<void>;
   /** Get current metrics snapshot */
   getMetrics: () => MetricsSnapshot;
+  /** Get the current listener health */
+  getHealth: () => NostrBusHealth;
   /** Publish a profile (kind:0) to all relays */
   publishProfile: (profile: NostrProfile) => Promise<ProfilePublishResult>;
   /** Get the last profile publish state */
@@ -395,7 +485,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
 
   const sk = validatePrivateKey(privateKey);
   const pk = getPublicKey(sk);
-  const pool = new SimplePool();
+  const pool = new SimplePool({ enablePing: true, enableReconnect: false });
   const accountId = options.accountId ?? pk.slice(0, 16);
   const gatewayStartedAt = Math.floor(Date.now() / 1000);
   const guardPolicy = createDirectDmPreCryptoGuardPolicy({
@@ -675,28 +765,39 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
   const dmFilter = { kinds: [NIP17_GIFT_WRAP_KIND], "#p": [pk], since } satisfies Parameters<
     typeof pool.subscribeMany
   >[1];
-  const relayAbort = new AbortController();
-  const sub = pool.subscribeMany(relays, dmFilter, {
-    onevent: (event) => {
-      void handleEvent(event);
-    },
-    oneose: () => {
-      // EOSE handler - called when all stored events have been received
-      for (const relay of relays) {
+  const relayHealth = new Map<string, SubscriptionHealth>();
+  const publishAggregateHealth = () => options.onHealth?.(aggregateSubscriptionHealth(relays, relayHealth));
+  const subscriptions = relays.map((relay) =>
+    createSubscriptionSupervisor<Event>({
+      subscribe: (callbacks) =>
+        pool.subscribeMany([relay], dmFilter, {
+          ...callbacks,
+          onauth: async (authEvent) => finalizeEvent(authEvent, sk),
+        }),
+      onEvent: (event) => {
+        void handleEvent(event);
+      },
+      onEose: () => {
         metrics.emit("relay.message.eose", 1, { relay });
-      }
-      onEose?.(relays.join(", "));
-    },
-    onclose: (reason) => {
-      // Handle subscription close
-      for (const relay of relays) {
+        metrics.emit("relay.connect", 1, { relay });
+        options.onConnect?.(relay);
+        onEose?.(relay);
+      },
+      onClose: (reasons) => {
         metrics.emit("relay.message.closed", 1, { relay });
+        metrics.emit("relay.disconnect", 1, { relay });
         options.onDisconnect?.(relay);
-      }
-      onError?.(new Error(`Subscription closed: ${reason.join(", ")}`), "subscription");
-    },
-    abort: relayAbort.signal,
-  });
+        onError?.(new Error(`Subscription closed: ${reasons.join(", ")}`), `subscription ${relay}`);
+      },
+      onReconnectAttempt: () => {
+        metrics.emit("relay.reconnect", 1, { relay });
+      },
+      onStateChange: (health) => {
+        relayHealth.set(relay, health);
+        publishAggregateHealth();
+      },
+    }),
+  );
 
   // Public sendDm function
   const sendDm = async (toPubkey: string, text: string): Promise<void> => {
@@ -754,12 +855,8 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
 
   return {
     close: () => {
-      relayAbort.abort("closed by caller");
-      void Promise.resolve(sub.close("closed by caller"))
-        .catch((err: unknown) => onError?.(err as Error, "close subscription"))
-        .finally(() => {
-          pool.close(relays);
-        });
+      for (const subscription of subscriptions) subscription.stop();
+      pool.close(relays);
       seen.stop();
       perSenderRateLimiter.clear();
       globalRateLimiter.clear();
@@ -777,6 +874,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
     publicKey: pk,
     sendDm,
     getMetrics: () => metrics.getSnapshot(),
+    getHealth: () => aggregateSubscriptionHealth(relays, relayHealth),
     publishProfile,
     getProfileState,
   };
@@ -814,8 +912,11 @@ async function sendEncryptedDm(
   // Sort relays by health score (best first)
   const sortedRelays = healthTracker.getSortedRelays(inboxRelays);
 
-  // Try relays in order of health, respecting circuit breakers
+  // Replicate to every healthy advertised inbox relay. A single accepted
+  // publish is enough for success, but writing to all of them prevents a
+  // client from missing replies when it is temporarily reading only one.
   let lastError: Error | undefined;
+  const eligibleRelays: string[] = [];
   for (const relay of sortedRelays) {
     let cb = circuitBreakers.get(relay);
     if (!cb) {
@@ -827,29 +928,28 @@ async function sendEncryptedDm(
     if (cb && !cb.canAttempt()) {
       continue;
     }
-
-    const startTime = Date.now();
-    try {
-      await publishEventWithNip42Auth(pool, relay, reply, sk);
-      const latency = Date.now() - startTime;
-
-      // Record success
-      cb?.recordSuccess();
-      healthTracker.recordSuccess(relay, latency);
-
-      return; // Success - exit early
-    } catch (err) {
-      lastError = err as Error;
-      const latency = Date.now() - startTime;
-
-      // Record failure
-      cb?.recordFailure();
-      healthTracker.recordFailure(relay);
-      metrics.emit("relay.error", 1, { relay, latency });
-
-      onError?.(lastError, `publish to ${relay}`);
-    }
+    eligibleRelays.push(relay);
   }
 
-  throw new Error(`Failed to publish to any relay: ${lastError?.message}`);
+  const results = await publishEventToAllRelays(pool, eligibleRelays, reply, sk);
+  let successes = 0;
+  for (const result of results) {
+    const cb = circuitBreakers.get(result.relay);
+    if (!result.error) {
+      successes += 1;
+      cb?.recordSuccess();
+      healthTracker.recordSuccess(result.relay, result.durationMs);
+      continue;
+    }
+    lastError = result.error;
+    cb?.recordFailure();
+    healthTracker.recordFailure(result.relay);
+    metrics.emit("relay.error", 1, { relay: result.relay, latency: result.durationMs });
+    onError?.(result.error, `publish to ${result.relay}`);
+  }
+  if (successes > 0) {
+    return;
+  }
+
+  throw new Error(`Failed to publish to any relay: ${lastError?.message ?? "no relay available"}`);
 }
