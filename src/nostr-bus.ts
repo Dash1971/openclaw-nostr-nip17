@@ -1,5 +1,13 @@
 // Nostr plugin module implements nostr bus behavior.
-import { SimplePool, finalizeEvent, getPublicKey, verifyEvent, type Event } from "nostr-tools";
+import {
+  SimplePool,
+  finalizeEvent,
+  getPublicKey,
+  verifyEvent,
+  type Event,
+  type EventTemplate,
+  type VerifiedEvent,
+} from "nostr-tools";
 import {
   createDirectDmPreCryptoGuardPolicy,
   type DirectDmPreCryptoGuardPolicyOverrides,
@@ -46,6 +54,31 @@ const CIRCUIT_BREAKER_RESET_MS = 30000; // 30 seconds before half-open
 
 // Health tracker configuration
 const HEALTH_WINDOW_MS = 60000; // 1 minute window for health stats
+
+type RelayPublisher = {
+  publish: (
+    relays: string[],
+    event: Event,
+    params?: {
+      onauth?: (event: EventTemplate) => Promise<VerifiedEvent>;
+    },
+  ) => Promise<string>[];
+};
+
+export async function publishEventWithNip42Auth(
+  pool: RelayPublisher,
+  relay: string,
+  event: Event,
+  sk: Uint8Array,
+): Promise<void> {
+  const publishPromises = pool.publish([relay], event, {
+    onauth: async (authEvent) => finalizeEvent(authEvent, sk),
+  });
+  if (publishPromises.length === 0) {
+    throw new Error(`Failed to create publish promise for relay ${relay}`);
+  }
+  await publishPromises[0];
+}
 
 // ============================================================================
 // Types
@@ -635,7 +668,9 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
     },
     sk,
   );
-  await Promise.allSettled(pool.publish(relays, inboxRelayEvent));
+  await Promise.allSettled(
+    relays.map((relay) => publishEventWithNip42Auth(pool, relay, inboxRelayEvent, sk)),
+  );
 
   const dmFilter = { kinds: [NIP17_GIFT_WRAP_KIND], "#p": [pk], since } satisfies Parameters<
     typeof pool.subscribeMany
@@ -795,12 +830,7 @@ async function sendEncryptedDm(
 
     const startTime = Date.now();
     try {
-      const publishPromises = pool.publish([relay], reply);
-      if (publishPromises.length === 0) {
-        throw new Error(`Failed to create publish promise for relay ${relay}`);
-      }
-      const publishPromise = publishPromises[0];
-      await publishPromise;
+      await publishEventWithNip42Auth(pool, relay, reply, sk);
       const latency = Date.now() - startTime;
 
       // Record success
