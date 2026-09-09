@@ -17,3 +17,5 @@ Keep outside the repository and GitHub discussions:
 Before posting, check the diff and any attachments. Use placeholders or synthetic fixtures rather than redacting a few values from a complete operational log.
 
 Changing a file does not remove its previous contents from Git history, caches, forks, or existing clones. If a real credential is ever exposed, revoke or rotate it and handle history cleanup separately.
+
+After a history rewrite, use a fresh clone or a carefully cleaned branch. Do not merge or push pre-rewrite branches back into the repository; doing so can restore removed history. Preserve uncommitted work privately before replacing a clone.
