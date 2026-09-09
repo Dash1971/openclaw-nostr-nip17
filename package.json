@@ -14,10 +14,12 @@
   },
   "dependencies": {
     "nostr-tools": "2.23.9",
+    "ws": "8.21.3",
     "zod": "4.4.3"
   },
   "devDependencies": {
     "@types/node": "^24.3.0",
+    "@types/ws": "^8.18.1",
     "openclaw": "2026.7.1-2",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"

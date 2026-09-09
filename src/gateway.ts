@@ -15,6 +15,7 @@ import { getNostrRuntime } from "./runtime.js";
 import { resolveDefaultNostrAccountId, type ResolvedNostrAccount } from "./types.js";
 import { createTotpAuthenticator } from "./totp-auth.js";
 import { buildNostrInboundAuthContext } from "./inbound-auth-context.js";
+import type { NostrBusHealth } from "./nostr-bus.js";
 
 type NostrGatewayStart = NonNullable<
   NonNullable<ChannelPlugin<ResolvedNostrAccount>["gateway"]>["startAccount"]
@@ -29,6 +30,37 @@ type NostrOutboundAdapter = Pick<
 const activeBuses = new Map<string, NostrBusHandle>();
 const metricsSnapshots = new Map<string, MetricsSnapshot>();
 const ACCESS_GROUP_PREFIX = "accessGroup:";
+
+export function buildNostrListenerStatus<
+  T extends { lastTransportActivityAt?: number | null },
+>(
+  previous: T,
+  account: { accountId: string; publicKey: string },
+  health: NostrBusHealth,
+) {
+  const connected = health.connectedRelays > 0;
+  return {
+    ...previous,
+    accountId: account.accountId,
+    publicKey: account.publicKey,
+    running: health.state !== "stopped",
+    connected,
+    statusState: health.state,
+    healthState: health.state,
+    reconnectAttempts: health.reconnectAttempts,
+    lastConnectedAt: health.lastConnectedAt,
+    lastDisconnect: health.lastDisconnectedAt
+      ? { at: health.lastDisconnectedAt, error: health.lastError ?? undefined }
+      : null,
+    lastError: health.lastError,
+    lastInboundAt: health.lastEventAt,
+    // nostr-tools does not expose ping/pong timestamps. Reporting message,
+    // EOSE, or connection timestamps as transport heartbeat activity makes a
+    // healthy idle relay look stale to the host after 30 minutes. Null tells
+    // the host to rely on the explicit connected/health state instead.
+    lastTransportActivityAt: null,
+  };
+}
 
 function parseNostrAccessGroupAllowFromEntry(entry: string): string | null {
   const trimmed = entry.trim();
@@ -120,6 +152,12 @@ export const startNostrGatewayAccount: NostrGatewayStart = async (ctx) => {
     });
 
   let busHandle: NostrBusHandle | null = null;
+  let shutdownPromise: Promise<void> | null = null;
+
+  const updateListenerStatus = (health: NostrBusHealth) => {
+    const previous = ctx.getStatus();
+    ctx.setStatus(buildNostrListenerStatus(previous, account, health));
+  };
 
   const authorizeSender = async (input: {
     senderId: string;
@@ -246,6 +284,7 @@ export const startNostrGatewayAccount: NostrGatewayStart = async (ctx) => {
         onEose: (relays) => {
           ctx.log?.debug?.(`[${account.accountId}] EOSE received from relays: ${relays}`);
         },
+        onHealth: updateListenerStatus,
         onMetric: (event: MetricEvent) => {
           if (event.name.startsWith("event.rejected.")) {
             ctx.log?.debug?.(
@@ -281,19 +320,30 @@ export const startNostrGatewayAccount: NostrGatewayStart = async (ctx) => {
             return;
           }
           stopped = true;
-          bus.close();
-          if (busHandle === bus) {
-            busHandle = null;
-          }
-          if (activeBuses.get(account.accountId) === bus) {
-            activeBuses.delete(account.accountId);
-          }
-          metricsSnapshots.delete(account.accountId);
-          ctx.log?.info?.(`[${account.accountId}] Nostr provider stopped`);
+          shutdownPromise = bus
+            .close()
+            .catch((error: unknown) => {
+              ctx.log?.error?.(
+                `[${account.accountId}] failed to close Nostr provider cleanly: ${String(error)}`,
+              );
+            })
+            .then(() => {
+              if (busHandle === bus) {
+                busHandle = null;
+              }
+              if (activeBuses.get(account.accountId) === bus) {
+                activeBuses.delete(account.accountId);
+              }
+              metricsSnapshots.delete(account.accountId);
+              ctx.log?.info?.(`[${account.accountId}] Nostr provider stopped`);
+            });
         },
       };
     },
   });
+  if (shutdownPromise) {
+    await shutdownPromise;
+  }
 };
 
 export const nostrPairingTextAdapter = {
