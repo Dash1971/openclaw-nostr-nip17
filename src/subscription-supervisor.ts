@@ -26,8 +26,8 @@ type TimerHandle = ReturnType<typeof setTimeout>;
 
 export function createSubscriptionSupervisor<EventType>(options: {
   subscribe: (callbacks: SubscriptionCallbacks<EventType>) => SubscriptionCloser;
-  onEvent: (event: EventType) => void;
-  onEose?: () => void;
+  onEvent: (event: EventType, generation: number) => void;
+  onEose?: (generation: number) => void;
   onClose?: (reasons: string[]) => void;
   onReconnectAttempt?: (attempt: number) => void;
   onStateChange?: (health: SubscriptionHealth) => void;
@@ -149,12 +149,12 @@ export function createSubscriptionSupervisor<EventType>(options: {
         onevent: (event) => {
           if (stopped || token !== callbackToken) return;
           markHealthy("event");
-          options.onEvent(event);
+          options.onEvent(event, health.generation);
         },
         oneose: () => {
           if (stopped || token !== callbackToken) return;
           markHealthy("eose");
-          options.onEose?.();
+          options.onEose?.(health.generation);
         },
         onclose: (reasons) => handleClose(token, reasons),
       });

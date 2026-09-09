@@ -1,6 +1,5 @@
 // Nostr plugin module implements nostr bus behavior.
 import {
-  SimplePool,
   finalizeEvent,
   getPublicKey,
   verifyEvent,
@@ -8,6 +7,8 @@ import {
   type EventTemplate,
   type VerifiedEvent,
 } from "nostr-tools";
+import { AbstractSimplePool } from "nostr-tools/abstract-pool";
+import WebSocket from "ws";
 import {
   createDirectDmPreCryptoGuardPolicy,
   type DirectDmPreCryptoGuardPolicyOverrides,
@@ -141,6 +142,37 @@ type RelayPublisher = {
   ) => Promise<string>[];
 };
 
+type WebSocketImplementation = new (address: string | URL) => WebSocket;
+
+function createLifecycleWebSocketImplementation(
+  sockets: Set<WebSocket>,
+  Base: WebSocketImplementation = WebSocket,
+) {
+  return class LifecycleWebSocket extends Base {
+    constructor(address: string | URL) {
+      super(address);
+      sockets.add(this);
+      this.addEventListener("close", () => sockets.delete(this), { once: true });
+    }
+  };
+}
+
+function closeTrackedSockets(sockets: Set<WebSocket>): void {
+  for (const socket of sockets) {
+    if (socket.readyState === WebSocket.CLOSED) continue;
+    try {
+      socket.terminate();
+    } catch {
+      try {
+        socket.close();
+      } catch {
+        // Best effort only after terminate/close both reject.
+      }
+    }
+  }
+  sockets.clear();
+}
+
 function assertLifecycleActive(abort?: AbortSignal): void {
   if (abort?.aborted) throw new Error("Nostr bus lifecycle has ended");
 }
@@ -160,7 +192,11 @@ export async function publishEventWithNip42Auth(
   if (publishPromises.length === 0) {
     throw new Error(`Failed to create publish promise for relay ${relay}`);
   }
-  await publishPromises[0];
+  const result = await publishPromises[0];
+  assertLifecycleActive(abort);
+  if (result.startsWith("connection failure:")) {
+    throw new Error(`Failed to connect to relay ${relay}: ${result}`);
+  }
 }
 
 export async function publishEventToAllRelays(
@@ -189,16 +225,16 @@ export async function publishEventToAllRelays(
 }
 
 async function queryLatestEvent(
-  pool: SimplePool,
+  pool: AbstractSimplePool,
   relays: string[],
-  filter: Parameters<SimplePool["subscribeMany"]>[1],
+  filter: Parameters<AbstractSimplePool["subscribeMany"]>[1],
   abort?: AbortSignal,
 ): Promise<Event | null> {
   assertLifecycleActive(abort);
   return await new Promise<Event | null>((resolve, reject) => {
     let latest: Event | null = null;
     let settled = false;
-    let closer: ReturnType<SimplePool["subscribeMany"]> | undefined;
+    let closer: ReturnType<AbstractSimplePool["subscribeMany"]> | undefined;
     const finish = (result: Event | null, error?: Error) => {
       if (settled) return;
       settled = true;
@@ -271,6 +307,8 @@ interface NostrBusOptions {
   shutdownDrainMs?: number;
   /** Clock override for deterministic replay-retention tests */
   now?: () => number;
+  /** WebSocket implementation override for controlled transport tests */
+  websocketImplementation?: WebSocketImplementation;
 }
 
 type FixedWindowRateLimiter = {
@@ -561,7 +599,17 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
 
   const sk = validatePrivateKey(privateKey);
   const pk = getPublicKey(sk);
-  const pool = new SimplePool({ enablePing: true, enableReconnect: false });
+  const trackedSockets = new Set<WebSocket>();
+  const pool = new AbstractSimplePool({
+    verifyEvent,
+    websocketImplementation: createLifecycleWebSocketImplementation(
+      trackedSockets,
+      options.websocketImplementation,
+    ) as unknown as typeof globalThis.WebSocket,
+    maxWaitForConnection: 3_000,
+    enablePing: true,
+    enableReconnect: false,
+  });
   const accountId = options.accountId ?? pk.slice(0, 16);
   const gatewayStartedAt = Math.floor(Date.now() / 1000);
   const guardPolicy = createDirectDmPreCryptoGuardPolicy({
@@ -944,37 +992,48 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
       since: computeReplaySinceTimestamp(caughtUpAt),
     }) satisfies Parameters<typeof pool.subscribeMany>[1];
   const relayHealth = new Map<string, SubscriptionHealth>();
-  const relayCatchUpTargets = new Map<
-    string,
-    { candidate: number; transportEoseDeadlineAt: number }
-  >();
-  const relayCaughtUpGenerations = new Map<string, number>();
+  type RelayCatchUpGeneration = {
+    generation: number;
+    candidate: number;
+    transportEoseDeadlineAt: number;
+    eose: boolean;
+    pending: Set<Promise<unknown>>;
+  };
+  const relayCatchUp = new Map<string, RelayCatchUpGeneration>();
   const publishAggregateHealth = () => options.onHealth?.(aggregateSubscriptionHealth(relays, relayHealth));
-  const advanceCatchUpCheckpoint = (candidate: number) => {
-    const handlersBeforeEose = [...activeOperations];
-    void Promise.allSettled(handlersBeforeEose).then(() => {
-      if (closing || lifecycleClosed) return;
-      if (retryableEventIds.size > 0) return;
-      if (
-        !relays.every((relay) => {
-          const health = relayHealth.get(relay);
-          return (
-            health?.state === "healthy" && relayCaughtUpGenerations.get(relay) === health.generation
-          );
-        })
-      ) {
-        return;
-      }
-      caughtUpAt = Math.max(caughtUpAt, candidate);
-      scheduleStatePersist();
+  const tryAdvanceCatchUpCheckpoint = () => {
+    if (closing || lifecycleClosed || retryableEventIds.size > 0) return;
+    const current = relays.flatMap((relay) => {
+      const health = relayHealth.get(relay);
+      const catchUp = relayCatchUp.get(relay);
+      return health && catchUp ? [{ health, catchUp }] : [];
     });
+    if (
+      current.length !== relays.length ||
+      current.some(
+        ({ health, catchUp }) =>
+          health.state !== "healthy" ||
+          catchUp.generation !== health.generation ||
+          !catchUp.eose ||
+          catchUp.pending.size > 0,
+      )
+    ) {
+      return;
+    }
+    const commonCandidate = Math.min(...current.map(({ catchUp }) => catchUp.candidate));
+    caughtUpAt = Math.max(caughtUpAt, commonCandidate);
+    scheduleStatePersist();
   };
   const subscriptions = relays.map((relay) =>
     createSubscriptionSupervisor<Event>({
       subscribe: (callbacks) => {
-        relayCatchUpTargets.set(relay, {
+        const generation = relayHealth.get(relay)?.generation ?? 0;
+        relayCatchUp.set(relay, {
+          generation,
           candidate: Math.floor(Date.now() / 1000),
           transportEoseDeadlineAt: Date.now() + TRANSPORT_EOSE_TIMEOUT_MS,
+          eose: false,
+          pending: new Set(),
         });
         return pool.subscribeMany([relay], buildDmFilter(), {
           ...callbacks,
@@ -982,24 +1041,38 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
           onauth: async (authEvent) => finalizeEvent(authEvent, sk),
         });
       },
-      onEvent: (event) => {
-        void trackOperation(() => handleEvent(event)).catch((error: unknown) => {
+      onEvent: (event, generation) => {
+        const operation = trackOperation(() => handleEvent(event));
+        const catchUp = relayCatchUp.get(relay);
+        if (catchUp?.generation === generation && !catchUp.eose) {
+          catchUp.pending.add(operation);
+          void operation.finally(() => {
+            catchUp.pending.delete(operation);
+            tryAdvanceCatchUpCheckpoint();
+          });
+        }
+        void operation.catch((error: unknown) => {
           if (!closing) onError?.(error as Error, `event ${event.id}`);
         });
       },
-      onEose: () => {
-        const target = relayCatchUpTargets.get(relay);
+      onEose: (generation) => {
+        const target = relayCatchUp.get(relay);
         // nostr-tools invokes oneose for both wire EOSE and its local timeout.
         // A callback at/after the configured deadline is not evidence that the
         // relay completed backlog delivery and must never advance caughtUpAt.
-        if (!target || Date.now() >= target.transportEoseDeadlineAt) return;
-        const health = relayHealth.get(relay);
-        if (health) relayCaughtUpGenerations.set(relay, health.generation);
+        if (
+          !target ||
+          target.generation !== generation ||
+          Date.now() >= target.transportEoseDeadlineAt
+        ) {
+          return;
+        }
+        target.eose = true;
         metrics.emit("relay.message.eose", 1, { relay });
         metrics.emit("relay.connect", 1, { relay });
         options.onConnect?.(relay);
         onEose?.(relay);
-        advanceCatchUpCheckpoint(target.candidate);
+        tryAdvanceCatchUpCheckpoint();
       },
       onClose: (reasons) => {
         metrics.emit("relay.message.closed", 1, { relay });
@@ -1012,7 +1085,9 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
       },
       onStateChange: (health) => {
         relayHealth.set(relay, health);
-        if (health.state !== "healthy") relayCaughtUpGenerations.delete(relay);
+        if (relayCatchUp.get(relay)?.generation !== health.generation) {
+          relayCatchUp.delete(relay);
+        }
         publishAggregateHealth();
       },
       connectionTimeoutMs: SUBSCRIPTION_HEALTH_TIMEOUT_MS,
@@ -1084,6 +1159,10 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
     close: () => {
       if (closePromise) return closePromise;
       closing = true;
+      // Stop in-progress discovery/connect/publication work immediately. Message
+      // handlers may still finish inside the bounded drain, but shutdown must
+      // never allow them to open new transport work.
+      lifecycleAbort.abort();
       closePromise = (async () => {
         for (const subscription of subscriptions) subscription.stop();
         if (pendingWrite) {
@@ -1100,12 +1179,12 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
         ]);
         if (drainTimer) clearTimeout(drainTimer);
         lifecycleClosed = true;
-        lifecycleAbort.abort();
         if (pendingPersist) {
           await pendingPersist;
         }
         await persistState();
         pool.destroy();
+        closeTrackedSockets(trackedSockets);
         seen.stop();
         rumors.stop();
         perSenderRateLimiter.clear();
@@ -1130,7 +1209,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
  * Send an encrypted DM to a pubkey
  */
 async function sendEncryptedDm(
-  pool: SimplePool,
+  pool: AbstractSimplePool,
   sk: Uint8Array,
   toPubkey: string,
   text: string,

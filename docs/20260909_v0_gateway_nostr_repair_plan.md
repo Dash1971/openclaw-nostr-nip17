@@ -1,6 +1,6 @@
 # Gateway lifecycle and Nostr recovery: public design requirements
 
-Status: design under review. This document is generic deployment guidance, not an operator runbook or authorization to change a running service. The latest implementation response is summarized in [the third review follow-up](20260909_v2_review_followup.md).
+Status: design under review. This document is generic deployment guidance, not an operator runbook or authorization to change a running service. The latest implementation response is summarized in [the fourth review follow-up](20260909_v3_review_followup.md).
 
 ## Review references
 

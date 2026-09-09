@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import type { Duplex } from "node:stream";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -308,6 +309,133 @@ describe("Nostr bus recovery boundaries", () => {
     }
   });
 
+  it("does not certify a multi-relay checkpoint while another relay generation is pending", async () => {
+    const nowMs = Date.now();
+    const caughtUpAt = Math.floor(nowMs / 1000) - 60 * 60;
+    const recipientKey = generateSecretKey();
+    const recipientPubkey = getPublicKey(recipientKey);
+    const eventA = createBoundaryWrap({
+      recipientPubkey,
+      senderKey: generateSecretKey(),
+      nowMs,
+      content: "relay A backlog",
+    });
+    const eventB = createBoundaryWrap({
+      recipientPubkey,
+      senderKey: generateSecretKey(),
+      nowMs,
+      content: "relay B backlog",
+    });
+    await writeNostrBusState({
+      accountId: "multi-relay-pending",
+      lastProcessedAt: caughtUpAt,
+      gatewayStartedAt: caughtUpAt,
+      caughtUpAt,
+    });
+
+    let releaseA!: () => void;
+    let releaseB!: () => void;
+    const gateA = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    const gateB = new Promise<void>((resolve) => {
+      releaseB = resolve;
+    });
+    const started = new Set<string>();
+    const eoseRelays = new Set<string>();
+    const server = createServer();
+    const relay = new WebSocketServer({ server });
+    relay.on("connection", (socket, request) => {
+      const relayName = request.url === "/a" ? "a" : "b";
+      socket.on("message", (raw) => {
+        const message = JSON.parse(raw.toString()) as unknown[];
+        if (message[0] === "EVENT") {
+          const published = message[1] as Event;
+          socket.send(JSON.stringify(["OK", published.id, true, "accepted"]));
+        }
+        if (message[0] === "REQ" && typeof message[1] === "string") {
+          const filter = message[2] as { kinds?: number[] } | undefined;
+          if (!filter?.kinds?.includes(1059)) {
+            socket.send(JSON.stringify(["EOSE", message[1]]));
+            return;
+          }
+          if (relayName === "a") {
+            socket.send(JSON.stringify(["EVENT", message[1], eventA]));
+            socket.send(JSON.stringify(["EOSE", message[1]]));
+            return;
+          }
+          void waitFor(() => started.has("relay A backlog")).then(() => {
+            socket.send(JSON.stringify(["EVENT", message[1], eventB]));
+            socket.send(JSON.stringify(["EOSE", message[1]]));
+          });
+        }
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Relay did not expose a port");
+    const relayA = `ws://127.0.0.1:${address.port}/a`;
+    const relayB = `ws://127.0.0.1:${address.port}/b`;
+    const bus = await startNostrBus({
+      accountId: "multi-relay-pending",
+      privateKey: Buffer.from(recipientKey).toString("hex"),
+      relays: [relayA, relayB],
+      statePersistIntervalMs: 50,
+      shutdownDrainMs: 100,
+      onEose: (url) => eoseRelays.add(url),
+      onMessage: async (_sender, text) => {
+        started.add(text);
+        if (text === "relay A backlog") await gateA;
+        if (text === "relay B backlog") {
+          await gateB;
+          throw new Error("relay B transient failure");
+        }
+      },
+    });
+
+    try {
+      await waitFor(() => started.size === 2 && eoseRelays.size === 2);
+      releaseA();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const whileBPending = await readNostrBusState({ accountId: "multi-relay-pending" });
+      expect(whileBPending?.caughtUpAt).toBe(caughtUpAt);
+      expect(whileBPending?.processedRumorIds).toHaveLength(1);
+
+      await bus.close();
+      const afterBoundedClose = await readNostrBusState({ accountId: "multi-relay-pending" });
+      expect(afterBoundedClose?.caughtUpAt).toBe(caughtUpAt);
+      expect(afterBoundedClose?.processedRumorIds).toHaveLength(1);
+      releaseB();
+
+      let recoveredB = 0;
+      const replacement = await startNostrBus({
+        accountId: "multi-relay-pending",
+        privateKey: Buffer.from(recipientKey).toString("hex"),
+        relays: [relayA, relayB],
+        onMessage: async (_sender, text) => {
+          if (text === "relay B backlog") recoveredB += 1;
+        },
+      });
+      try {
+        await waitFor(() => recoveredB === 1);
+      } finally {
+        await replacement.close();
+      }
+    } finally {
+      releaseA();
+      releaseB();
+      await bus.close();
+      for (const socket of relay.clients) socket.terminate();
+      await new Promise<void>((resolve) => relay.close(() => resolve()));
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+  });
+
   it("aborts pending inbox discovery without opening or publishing to a relay after close", async () => {
     const routes = new Map<string, string>();
     class RoutedWebSocket extends WebSocket {
@@ -370,6 +498,7 @@ describe("Nostr bus recovery boundaries", () => {
       accountId: "pending-discovery-close",
       privateKey: Buffer.from(generateSecretKey()).toString("hex"),
       relays: [configuredRelay],
+      websocketImplementation: RoutedWebSocket,
       shutdownDrainMs: 100,
       onMessage: async () => {},
     });
@@ -395,4 +524,138 @@ describe("Nostr bus recovery boundaries", () => {
       });
     }
   });
+
+  it(
+    "aborts a pending relay handshake without false success or a surviving socket",
+    async () => {
+      const routes = new Map<string, string>();
+      const recipientClients: WebSocket[] = [];
+      class RoutedWebSocket extends WebSocket {
+        constructor(address: string | URL) {
+          const original = String(address);
+          super(routes.get(original) ?? routes.get(original.replace(/\/$/, "")) ?? original);
+          if (original.startsWith("wss://held-recipient-relay.example")) {
+            recipientClients.push(this);
+          }
+        }
+      }
+
+      const server = createServer();
+      const relay = new WebSocketServer({ noServer: true });
+      const recipientKey = generateSecretKey();
+      const recipientPubkey = getPublicKey(recipientKey);
+      const discoveredRelay = "wss://held-recipient-relay.example";
+      const inboxEvent = finalizeEvent(
+        {
+          kind: 10050,
+          content: "",
+          tags: [["relay", discoveredRelay]],
+          created_at: Math.floor(Date.now() / 1000),
+        },
+        recipientKey,
+      );
+      let discoveryStarted = false;
+      let heldUpgradeSocket: Duplex | null = null;
+      let heldUpgrade:
+        | { request: Parameters<typeof relay.handleUpgrade>[0]; head: Buffer }
+        | null = null;
+      let liveRecipientConnections = 0;
+      let recipientPublications = 0;
+      server.on("upgrade", (request, socket, head) => {
+        if (request.url === "/recipient") {
+          heldUpgradeSocket = socket;
+          heldUpgrade = { request, head };
+          return;
+        }
+        relay.handleUpgrade(request, socket, head, (websocket) => {
+          relay.emit("connection", websocket, request);
+        });
+      });
+      relay.on("connection", (socket, request) => {
+        if (request.url === "/recipient") {
+          liveRecipientConnections += 1;
+          socket.once("close", () => {
+            liveRecipientConnections -= 1;
+          });
+        }
+        socket.on("message", (raw) => {
+          const message = JSON.parse(raw.toString()) as unknown[];
+          if (message[0] === "EVENT") {
+            const event = message[1] as Event;
+            if (request.url === "/recipient" && event.kind === 1059) {
+              recipientPublications += 1;
+            }
+            socket.send(JSON.stringify(["OK", event.id, true, "accepted"]));
+          }
+          if (message[0] === "REQ" && typeof message[1] === "string") {
+            const filter = message[2] as { kinds?: number[] } | undefined;
+            if (filter?.kinds?.includes(10050)) {
+              discoveryStarted = true;
+              socket.send(JSON.stringify(["EVENT", message[1], inboxEvent]));
+              socket.send(JSON.stringify(["EOSE", message[1]]));
+              return;
+            }
+            socket.send(JSON.stringify(["EOSE", message[1]]));
+          }
+        });
+      });
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+      });
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Relay did not expose a port");
+      const configuredRelay = `ws://127.0.0.1:${address.port}/configured`;
+      routes.set(discoveredRelay, `ws://127.0.0.1:${address.port}/recipient`);
+      routes.set(`${discoveredRelay}/`, `ws://127.0.0.1:${address.port}/recipient`);
+
+      const bus = await startNostrBus({
+        accountId: "pending-handshake-close",
+        privateKey: Buffer.from(generateSecretKey()).toString("hex"),
+        relays: [configuredRelay],
+        websocketImplementation: RoutedWebSocket,
+        onMessage: async () => {},
+      });
+      const sendResult = bus.sendDm(recipientPubkey, "must not report success").then(
+        () => "sent" as const,
+        () => "blocked" as const,
+      );
+
+      try {
+        await waitFor(() => discoveryStarted);
+        await waitFor(() => heldUpgradeSocket !== null);
+        await bus.close();
+        expect(await sendResult).toBe("blocked");
+        expect(recipientClients).toHaveLength(1);
+        expect(recipientClients[0]?.readyState).not.toBe(WebSocket.CONNECTING);
+        expect(recipientClients[0]?.readyState).not.toBe(WebSocket.OPEN);
+        const pending = heldUpgrade as
+          | { request: Parameters<typeof relay.handleUpgrade>[0]; head: Buffer }
+          | null;
+        const pendingSocket = heldUpgradeSocket as Duplex | null;
+        if (pending && pendingSocket && !pendingSocket.destroyed) {
+          try {
+            relay.handleUpgrade(pending.request, pendingSocket, pending.head, (websocket) => {
+              relay.emit("connection", websocket, pending.request);
+            });
+          } catch {
+            // A synchronously rejected upgrade also proves the socket cannot survive.
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(recipientClients[0]?.readyState).toBe(WebSocket.CLOSED);
+        expect(liveRecipientConnections).toBe(0);
+        expect(recipientPublications).toBe(0);
+      } finally {
+        await bus.close();
+        (heldUpgradeSocket as Duplex | null)?.destroy();
+        for (const socket of relay.clients) socket.terminate();
+        await new Promise<void>((resolve) => relay.close(() => resolve()));
+        await new Promise<void>((resolve, reject) => {
+          server.close((error) => (error ? reject(error) : resolve()));
+        });
+      }
+    },
+    10_000,
+  );
 });

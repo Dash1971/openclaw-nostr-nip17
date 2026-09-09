@@ -1,6 +1,6 @@
 # Reconnect hardening third review follow-up
 
-Status: implementation candidate ready for independent re-review. This document does not approve merge or deployment. Reviewers should pin the exact PR head commit after publication.
+Status: reviewed at commit `df0a05472cc5ce1586787816225188c545682e7d`; changes were requested. The response is documented in [the fourth review follow-up](20260909_v3_review_followup.md). This document does not approve merge or deployment.
 
 ## Review addressed
 
