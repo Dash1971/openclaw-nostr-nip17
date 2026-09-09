@@ -53,6 +53,8 @@ const MAX_PERSISTED_EVENT_IDS = 5000;
 const STATE_PERSIST_INTERVAL_MS = 5000;
 const DEFAULT_REPLAY_RETENTION_MS = (STARTUP_LOOKBACK_SEC + 300) * 1000;
 const DEFAULT_SHUTDOWN_DRAIN_MS = 4000;
+const SUBSCRIPTION_HEALTH_TIMEOUT_MS = 30_000;
+const TRANSPORT_EOSE_TIMEOUT_MS = 60_000;
 const DEFAULT_INBOUND_GUARD_POLICY = createDirectDmPreCryptoGuardPolicy();
 
 export function computeReplaySinceTimestamp(caughtUpAt: number): number {
@@ -139,6 +141,10 @@ type RelayPublisher = {
   ) => Promise<string>[];
 };
 
+function assertLifecycleActive(abort?: AbortSignal): void {
+  if (abort?.aborted) throw new Error("Nostr bus lifecycle has ended");
+}
+
 export async function publishEventWithNip42Auth(
   pool: RelayPublisher,
   relay: string,
@@ -146,6 +152,7 @@ export async function publishEventWithNip42Auth(
   sk: Uint8Array,
   abort?: AbortSignal,
 ): Promise<void> {
+  assertLifecycleActive(abort);
   const publishPromises = pool.publish([relay], event, {
     onauth: async (authEvent) => finalizeEvent(authEvent, sk),
     abort,
@@ -167,6 +174,7 @@ export async function publishEventToAllRelays(
     relays.map(async (relay) => {
       const startedAt = Date.now();
       try {
+        assertLifecycleActive(abort);
         await publishEventWithNip42Auth(pool, relay, event, sk, abort);
         return { relay, durationMs: Date.now() - startedAt };
       } catch (error) {
@@ -178,6 +186,40 @@ export async function publishEventToAllRelays(
       }
     }),
   );
+}
+
+async function queryLatestEvent(
+  pool: SimplePool,
+  relays: string[],
+  filter: Parameters<SimplePool["subscribeMany"]>[1],
+  abort?: AbortSignal,
+): Promise<Event | null> {
+  assertLifecycleActive(abort);
+  return await new Promise<Event | null>((resolve, reject) => {
+    let latest: Event | null = null;
+    let settled = false;
+    let closer: ReturnType<SimplePool["subscribeMany"]> | undefined;
+    const finish = (result: Event | null, error?: Error) => {
+      if (settled) return;
+      settled = true;
+      abort?.removeEventListener("abort", onAbort);
+      void closer?.close("inbox relay discovery complete");
+      if (error) reject(error);
+      else resolve(result);
+    };
+    const onAbort = () => finish(null, new Error("Nostr bus lifecycle has ended"));
+    abort?.addEventListener("abort", onAbort, { once: true });
+    closer = pool.subscribeMany(relays, { ...filter, limit: 1 }, {
+      onevent: (event) => {
+        if (!latest || event.created_at > latest.created_at) latest = event;
+      },
+      oneose: () => finish(latest),
+      onclose: () => finish(latest),
+      maxWait: 3_000,
+      abort,
+    });
+    if (abort?.aborted) onAbort();
+  });
 }
 
 // ============================================================================
@@ -533,6 +575,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
 
   // Initialize metrics
   const metrics = onMetric ? createMetrics(onMetric) : createNoopMetrics();
+  let caughtUpAt = gatewayStartedAt;
 
   // Initialize seen tracker with LRU
   const seen: SeenTracker = createSeenTracker({
@@ -544,6 +587,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
     ttlMs: seenTtlMs,
     retentionMs: replayRetentionMs,
     now: options.now,
+    protectedSince: () => computeReplaySinceTimestamp(caughtUpAt),
   });
 
   // Initialize circuit breakers and health tracker
@@ -556,7 +600,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
 
   // Read persisted state and compute `since` timestamp (with small overlap)
   const state = await readNostrBusState({ accountId });
-  let caughtUpAt =
+  caughtUpAt =
     state?.caughtUpAt ??
     state?.gatewayStartedAt ??
     state?.lastProcessedAt ??
@@ -630,6 +674,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
   }
 
   const inflight = new Set<string>();
+  const retryableEventIds = new Set<string>();
   const activeOperations = new Set<Promise<unknown>>();
   let closing = false;
   let lifecycleClosed = false;
@@ -681,6 +726,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
       ownsEventClaim = true;
 
       const markSeen = () => {
+        retryableEventIds.delete(event.id);
         seen.add(event.id);
         metrics.emit("memory.seen_tracker_size", seen.size());
       };
@@ -701,6 +747,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
       }
 
       if (event.created_at > Math.floor(Date.now() / 1000) + guardPolicy.maxFutureSkewSec) {
+        retryableEventIds.add(event.id);
         metrics.emit("event.rejected.future");
         return;
       }
@@ -749,6 +796,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
 
       if (Buffer.byteLength(event.content, "utf8") > guardPolicy.maxCiphertextBytes) {
         if (rejectIfGlobalRateLimited()) {
+          retryableEventIds.add(event.id);
           return;
         }
         rejectAndMarkSeen("event.rejected.oversized_ciphertext");
@@ -756,6 +804,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
       }
 
       if (rejectIfGlobalRateLimited()) {
+        retryableEventIds.add(event.id);
         return;
       }
 
@@ -777,7 +826,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
         return;
       }
 
-      const rumorClaim = rumors.claim(message.rumorId);
+      const rumorClaim = rumors.claim(message.rumorId, event.created_at);
       if (rumorClaim === "inflight") {
         metrics.emit("event.duplicate");
         return;
@@ -792,7 +841,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
 
       const markRumorProcessed = () => {
         if (!claimedRumorId) return;
-        rumors.complete(claimedRumorId);
+        rumors.complete(claimedRumorId, event.created_at);
         metrics.emit("memory.seen_tracker_size", seen.size() + rumors.size());
         claimedRumorId = null;
       };
@@ -809,7 +858,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
         return;
       }
       if (rejectIfVerifiedSenderRateLimited(message.senderPubkey)) {
-        markMessageProcessed();
+        retryableEventIds.add(event.id);
         return;
       }
 
@@ -863,6 +912,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
 
       // Persist progress (debounced)
     } catch (err) {
+      if (!lifecycleClosed) retryableEventIds.add(event.id);
       onError?.(err as Error, `event ${event.id}`);
     } finally {
       if (claimedRumorId) {
@@ -894,13 +944,17 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
       since: computeReplaySinceTimestamp(caughtUpAt),
     }) satisfies Parameters<typeof pool.subscribeMany>[1];
   const relayHealth = new Map<string, SubscriptionHealth>();
-  const relayCatchUpTargets = new Map<string, number>();
+  const relayCatchUpTargets = new Map<
+    string,
+    { candidate: number; transportEoseDeadlineAt: number }
+  >();
   const relayCaughtUpGenerations = new Map<string, number>();
   const publishAggregateHealth = () => options.onHealth?.(aggregateSubscriptionHealth(relays, relayHealth));
   const advanceCatchUpCheckpoint = (candidate: number) => {
     const handlersBeforeEose = [...activeOperations];
     void Promise.allSettled(handlersBeforeEose).then(() => {
       if (closing || lifecycleClosed) return;
+      if (retryableEventIds.size > 0) return;
       if (
         !relays.every((relay) => {
           const health = relayHealth.get(relay);
@@ -918,9 +972,13 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
   const subscriptions = relays.map((relay) =>
     createSubscriptionSupervisor<Event>({
       subscribe: (callbacks) => {
-        relayCatchUpTargets.set(relay, Math.floor(Date.now() / 1000));
+        relayCatchUpTargets.set(relay, {
+          candidate: Math.floor(Date.now() / 1000),
+          transportEoseDeadlineAt: Date.now() + TRANSPORT_EOSE_TIMEOUT_MS,
+        });
         return pool.subscribeMany([relay], buildDmFilter(), {
           ...callbacks,
+          maxWait: TRANSPORT_EOSE_TIMEOUT_MS,
           onauth: async (authEvent) => finalizeEvent(authEvent, sk),
         });
       },
@@ -930,13 +988,18 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
         });
       },
       onEose: () => {
+        const target = relayCatchUpTargets.get(relay);
+        // nostr-tools invokes oneose for both wire EOSE and its local timeout.
+        // A callback at/after the configured deadline is not evidence that the
+        // relay completed backlog delivery and must never advance caughtUpAt.
+        if (!target || Date.now() >= target.transportEoseDeadlineAt) return;
         const health = relayHealth.get(relay);
         if (health) relayCaughtUpGenerations.set(relay, health.generation);
         metrics.emit("relay.message.eose", 1, { relay });
         metrics.emit("relay.connect", 1, { relay });
         options.onConnect?.(relay);
         onEose?.(relay);
-        advanceCatchUpCheckpoint(relayCatchUpTargets.get(relay) ?? Math.floor(Date.now() / 1000));
+        advanceCatchUpCheckpoint(target.candidate);
       },
       onClose: (reasons) => {
         metrics.emit("relay.message.closed", 1, { relay });
@@ -952,6 +1015,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
         if (health.state !== "healthy") relayCaughtUpGenerations.delete(relay);
         publishAggregateHealth();
       },
+      connectionTimeoutMs: SUBSCRIPTION_HEALTH_TIMEOUT_MS,
     }),
   );
 
@@ -1078,15 +1142,17 @@ async function sendEncryptedDm(
   replyToEventId?: string,
   abort?: AbortSignal,
 ): Promise<void> {
-  const inboxEvent = await pool.get(relays, {
+  const inboxEvent = await queryLatestEvent(pool, relays, {
     kinds: [NIP17_INBOX_RELAYS_KIND],
     authors: [toPubkey],
-  });
+  }, abort);
+  assertLifecycleActive(abort);
   const inboxRelays = readInboxRelays(inboxEvent);
   if (inboxRelays.length === 0) {
     throw new Error(`Recipient ${toPubkey} has not published NIP-17 inbox relays (kind 10050)`);
   }
   const reply = createNip17Message(sk, toPubkey, text, replyToEventId);
+  assertLifecycleActive(abort);
 
   // Sort relays by health score (best first)
   const sortedRelays = healthTracker.getSortedRelays(inboxRelays);
@@ -1110,6 +1176,7 @@ async function sendEncryptedDm(
     eligibleRelays.push(relay);
   }
 
+  assertLifecycleActive(abort);
   const results = await publishEventToAllRelays(pool, eligibleRelays, reply, sk, abort);
   let successes = 0;
   for (const result of results) {

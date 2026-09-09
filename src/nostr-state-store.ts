@@ -5,11 +5,11 @@ import { readTextFileIfExists, writeJsonFileSecure } from "openclaw/plugin-sdk/s
 import path from "node:path";
 import type { PersistedClaimedId } from "./claimed-id-tracker.js";
 
-const STORE_VERSION = 5;
+const STORE_VERSION = 6;
 const PROFILE_STATE_VERSION = 1;
 
 type NostrBusState = {
-  version: 2 | 3 | 4 | 5;
+  version: 2 | 3 | 4 | 5 | 6;
   /** Unix timestamp (seconds) of the last processed event */
   lastProcessedAt: number | null;
   /** Gateway startup timestamp (seconds) - events before this are old */
@@ -96,7 +96,10 @@ export async function writeNostrBusState(params: {
         typeof entry?.id === "string" &&
         Boolean(entry.id) &&
         typeof entry.processedAt === "number" &&
-        Number.isFinite(entry.processedAt),
+        Number.isFinite(entry.processedAt) &&
+        (entry.latestEventCreatedAt === undefined ||
+          (typeof entry.latestEventCreatedAt === "number" &&
+            Number.isFinite(entry.latestEventCreatedAt))),
     ),
   };
   writeStateFile(

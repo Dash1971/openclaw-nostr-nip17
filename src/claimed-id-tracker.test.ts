@@ -93,4 +93,28 @@ describe("claimed ID tracker", () => {
     restarted.release("rumor");
     restarted.stop();
   });
+
+  it("retains IDs while their wrap timestamp remains inside the durable query window", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_800_000_000_000);
+    const retentionMs = 2 * 24 * 60 * 60 * 1000;
+    let protectedSince = 1_799_800_000;
+    const tracker = createClaimedIdTracker({
+      maxEntries: 1,
+      ttlMs: retentionMs,
+      retentionMs,
+      protectedSince: () => protectedSince,
+    });
+
+    expect(tracker.claim("long-lived", 1_799_900_000)).toBe("claimed");
+    tracker.complete("long-lived", 1_799_900_000);
+    vi.advanceTimersByTime(retentionMs + 11 * 60 * 1000);
+    expect(tracker.claim("long-lived", 1_799_900_000)).toBe("processed");
+
+    protectedSince = 1_799_900_001;
+    vi.advanceTimersByTime(retentionMs + 1);
+    expect(tracker.claim("long-lived", 1_799_900_000)).toBe("claimed");
+    tracker.release("long-lived");
+    tracker.stop();
+  });
 });
