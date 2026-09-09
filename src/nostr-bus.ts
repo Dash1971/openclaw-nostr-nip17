@@ -1071,7 +1071,10 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
       onEvent: (event, generation) => {
         const operation = trackOperation(() => handleEvent(event));
         const catchUp = relayCatchUp.get(relay);
-        if (catchUp?.generation === generation && !catchUp.eose) {
+        // EOSE certifies backlog transmission, not completion of future live
+        // deliveries. Track every inbound operation so a reconnect can retain
+        // any unfinished work that its new checkpoint candidate could skip.
+        if (catchUp?.generation === generation) {
           catchUp.pending.add(operation);
           void operation.finally(() => {
             catchUp.pending.delete(operation);

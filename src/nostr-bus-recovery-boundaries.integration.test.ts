@@ -15,9 +15,9 @@ import { setNostrRuntime } from "./runtime.js";
 useWebSocketImplementation(WebSocket);
 
 const waitFor = async (predicate: () => boolean, timeoutMs = 5_000): Promise<void> => {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = performance.now() + timeoutMs;
   while (!predicate()) {
-    if (Date.now() >= deadline) throw new Error("Timed out waiting for recovery boundary state");
+    if (performance.now() >= deadline) throw new Error("Timed out waiting for recovery boundary state");
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 };
@@ -50,14 +50,47 @@ function createBoundaryWrap(params: {
   }
 }
 
-async function createGenerationReplacementRelay(event: Event): Promise<{
+function createLiveBoundaryWrap(params: {
+  recipientPubkey: string;
+  senderKey: Uint8Array;
+  nowMs: number;
+  content: string;
+}): Event {
+  const dateSpy = vi.spyOn(Date, "now").mockReturnValue(params.nowMs);
+  const randomSpy = vi.spyOn(Math, "random").mockReturnValue(1);
+  try {
+    const rumor = createRumor(
+      {
+        kind: 14,
+        content: params.content,
+        tags: [["p", params.recipientPubkey]],
+        created_at: Math.floor(params.nowMs / 1000),
+      },
+      params.senderKey,
+    );
+    return createWrap(
+      createSeal(rumor, params.senderKey, params.recipientPubkey),
+      params.recipientPubkey,
+    );
+  } finally {
+    randomSpy.mockRestore();
+    dateSpy.mockRestore();
+  }
+}
+
+async function createGenerationReplacementRelay(
+  event: Event,
+  options: { eventAfterEose?: boolean; manualReplacement?: boolean } = {},
+): Promise<{
   url: string;
   giftWrapRequestCount: () => number;
+  replaceFirstGeneration: () => void;
   close: () => Promise<void>;
 }> {
   const server = createServer();
   const relay = new WebSocketServer({ server });
   let giftWrapRequests = 0;
+  let firstSubscription: { socket: WebSocket; id: string } | null = null;
   relay.on("connection", (socket) => {
     socket.on("message", (raw) => {
       const message = JSON.parse(raw.toString()) as unknown[];
@@ -72,10 +105,19 @@ async function createGenerationReplacementRelay(event: Event): Promise<{
           return;
         }
         giftWrapRequests += 1;
-        socket.send(JSON.stringify(["EVENT", message[1], event]));
         if (giftWrapRequests === 1) {
-          socket.send(JSON.stringify(["CLOSED", message[1], "forced generation replacement"]));
+          firstSubscription = { socket, id: message[1] };
+          if (options.eventAfterEose) {
+            socket.send(JSON.stringify(["EOSE", message[1]]));
+            socket.send(JSON.stringify(["EVENT", message[1], event]));
+          } else {
+            socket.send(JSON.stringify(["EVENT", message[1], event]));
+          }
+          if (!options.manualReplacement) {
+            socket.send(JSON.stringify(["CLOSED", message[1], "forced generation replacement"]));
+          }
         } else {
+          socket.send(JSON.stringify(["EVENT", message[1], event]));
           socket.send(JSON.stringify(["EOSE", message[1]]));
         }
       }
@@ -90,6 +132,16 @@ async function createGenerationReplacementRelay(event: Event): Promise<{
   return {
     url: `ws://127.0.0.1:${address.port}`,
     giftWrapRequestCount: () => giftWrapRequests,
+    replaceFirstGeneration: () => {
+      if (!firstSubscription) throw new Error("First subscription has not started");
+      firstSubscription.socket.send(
+        JSON.stringify([
+          "CLOSED",
+          firstSubscription.id,
+          "forced generation replacement",
+        ]),
+      );
+    },
     close: async () => {
       for (const socket of relay.clients) socket.terminate();
       await new Promise<void>((resolve) => relay.close(() => resolve()));
@@ -98,6 +150,119 @@ async function createGenerationReplacementRelay(event: Event): Promise<{
       });
     },
   };
+}
+
+async function exercisePostEoseGenerationReplacement(
+  outcome: "success" | "failure" | "abandon",
+): Promise<void> {
+  const nowMs = Date.now();
+  const certifiedAt = Math.floor(nowMs / 1000);
+  const caughtUpAt = certifiedAt - 60 * 60;
+  const recipientKey = generateSecretKey();
+  const event = createLiveBoundaryWrap({
+    recipientPubkey: getPublicKey(recipientKey),
+    senderKey: generateSecretKey(),
+    nowMs,
+    content: `post EOSE ${outcome}`,
+  });
+  const replayOverlapSec = 2 * 24 * 60 * 60 + 300;
+  const reconnectAt = certifiedAt + 6 * 60;
+  expect(event.created_at).toBeGreaterThanOrEqual(certifiedAt - replayOverlapSec);
+  expect(event.created_at).toBeLessThan(reconnectAt - replayOverlapSec);
+
+  const accountId = `post-eose-generation-${outcome}`;
+  await writeNostrBusState({
+    accountId,
+    lastProcessedAt: caughtUpAt,
+    gatewayStartedAt: caughtUpAt,
+    caughtUpAt,
+  });
+  const relay = await createGenerationReplacementRelay(event, {
+    eventAfterEose: true,
+    manualReplacement: true,
+  });
+  let fakeNowMs = nowMs;
+  const dateSpy = vi.spyOn(Date, "now").mockImplementation(() => fakeNowMs);
+  let releaseHandler!: () => void;
+  const handlerGate = new Promise<void>((resolve) => {
+    releaseHandler = resolve;
+  });
+  let handlerStarted = false;
+  let handlerCompleted = false;
+  let handlerFailed = false;
+  let recovered = 0;
+  const bus = await startNostrBus({
+    accountId,
+    privateKey: Buffer.from(recipientKey).toString("hex"),
+    relays: [relay.url],
+    statePersistIntervalMs: 50,
+    shutdownDrainMs: 100,
+    onMessage: async () => {
+      handlerStarted = true;
+      await handlerGate;
+      if (outcome === "failure") {
+        handlerFailed = true;
+        throw new Error("post-EOSE transient failure");
+      }
+      handlerCompleted = true;
+    },
+  });
+  let replacement: Awaited<ReturnType<typeof startNostrBus>> | null = null;
+
+  try {
+    await waitFor(() => handlerStarted);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const initial = await readNostrBusState({ accountId });
+    expect(initial?.caughtUpAt).toBe(certifiedAt);
+
+    fakeNowMs += 6 * 60 * 1000;
+    relay.replaceFirstGeneration();
+    await waitFor(() => relay.giftWrapRequestCount() >= 2);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const whilePending = await readNostrBusState({ accountId });
+    expect(whilePending?.caughtUpAt).toBe(certifiedAt);
+    expect(whilePending?.processedRumorIds ?? []).toEqual([]);
+
+    if (outcome === "success") {
+      releaseHandler();
+      await waitFor(() => handlerCompleted);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const completed = await readNostrBusState({ accountId });
+      expect(completed?.caughtUpAt).toBe(reconnectAt);
+      expect(completed?.processedRumorIds).toHaveLength(1);
+      return;
+    }
+
+    if (outcome === "failure") {
+      releaseHandler();
+      await waitFor(() => handlerFailed);
+    }
+
+    const closeStartedAt = performance.now();
+    await bus.close();
+    expect(performance.now() - closeStartedAt).toBeLessThan(1_000);
+    const afterClose = await readNostrBusState({ accountId });
+    expect(afterClose?.caughtUpAt).toBe(certifiedAt);
+    expect(afterClose?.processedRumorIds ?? []).toEqual([]);
+    releaseHandler();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    replacement = await startNostrBus({
+      accountId,
+      privateKey: Buffer.from(recipientKey).toString("hex"),
+      relays: [relay.url],
+      onMessage: async () => {
+        recovered += 1;
+      },
+    });
+    await waitFor(() => recovered === 1);
+  } finally {
+    releaseHandler();
+    await replacement?.close();
+    await bus.close();
+    dateSpy.mockRestore();
+    await relay.close();
+  }
 }
 
 describe("Nostr bus recovery boundaries", () => {
@@ -664,6 +829,18 @@ describe("Nostr bus recovery boundaries", () => {
       await replacement.close();
       await relay.close();
     }
+  });
+
+  it("waits for a post-EOSE live handler before advancing after reconnect", async () => {
+    await exercisePostEoseGenerationReplacement("success");
+  });
+
+  it("redelivers a failed post-EOSE live handler after reconnect and restart", async () => {
+    await exercisePostEoseGenerationReplacement("failure");
+  });
+
+  it("redelivers a post-EOSE live handler abandoned by bounded shutdown", async () => {
+    await exercisePostEoseGenerationReplacement("abandon");
   });
 
   it("aborts pending inbox discovery without opening or publishing to a relay after close", async () => {
