@@ -1,6 +1,6 @@
 # Gateway lifecycle and Nostr recovery: public design requirements
 
-Status: design under review. This document is generic deployment guidance, not an operator runbook or authorization to change a running service. The implementation response to the independent review is summarized in [the review follow-up](20260909_v0_review_followup.md).
+Status: design under review. This document is generic deployment guidance, not an operator runbook or authorization to change a running service. The latest implementation response is summarized in [the second review follow-up](20260909_v1_review_followup.md).
 
 ## Review references
 
@@ -19,7 +19,7 @@ A gateway should have one deliberate supervisor. Its lifecycle commands must add
 
 ## Requirements before deployment
 
-1. Obtain independent confirmation that the idle-health, replay-retention, ownership, and shutdown corrections in the review follow-up satisfy the findings.
+1. Obtain independent confirmation that the recovery, replay, persistence, ownership, health, and shutdown corrections in the latest review follow-up satisfy the findings.
 2. Inventory lifecycle entry points, including service repair, direct start/restart/install, updates, internal restart requests, and configuration reload. Establish which are permitted and how they reach the intended supervisor.
 3. Do not treat OPENCLAW_SERVICE_REPAIR_POLICY=external as a global restart guard. The reviewed host implementation applies it to doctor service repair; other restart paths require separate handling.
 4. Verify environment inheritance for each actual launcher. Editing a persistent environment source does not update a process that is already running.

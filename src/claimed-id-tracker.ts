@@ -34,9 +34,11 @@ export function createClaimedIdTracker(options?: {
     claim(id: string): IdClaimResult {
       pruneRetained();
       if (retained.has(id)) {
+        retained.set(id, now());
         return "processed";
       }
       if (processed.peek(id)) {
+        retained.set(id, now());
         return "processed";
       }
       if (inflight.has(id)) {

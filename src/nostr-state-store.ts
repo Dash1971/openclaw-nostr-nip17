@@ -5,15 +5,17 @@ import { readTextFileIfExists, writeJsonFileSecure } from "openclaw/plugin-sdk/s
 import path from "node:path";
 import type { PersistedClaimedId } from "./claimed-id-tracker.js";
 
-const STORE_VERSION = 4;
+const STORE_VERSION = 5;
 const PROFILE_STATE_VERSION = 1;
 
 type NostrBusState = {
-  version: 2 | 3 | 4;
+  version: 2 | 3 | 4 | 5;
   /** Unix timestamp (seconds) of the last processed event */
   lastProcessedAt: number | null;
   /** Gateway startup timestamp (seconds) - events before this are old */
   gatewayStartedAt: number | null;
+  /** Latest wall-clock point through which relay catch-up completed */
+  caughtUpAt?: number | null;
   /** Recent processed event IDs for overlap dedupe across restarts */
   recentEventIds: string[];
   /** Recent authenticated rumor IDs for dedupe across gift wraps and restarts */
@@ -74,6 +76,7 @@ export async function writeNostrBusState(params: {
   accountId?: string;
   lastProcessedAt: number;
   gatewayStartedAt: number;
+  caughtUpAt?: number;
   recentEventIds?: string[];
   recentRumorIds?: string[];
   processedRumorIds?: PersistedClaimedId[];
@@ -83,6 +86,7 @@ export async function writeNostrBusState(params: {
     version: STORE_VERSION,
     lastProcessedAt: params.lastProcessedAt,
     gatewayStartedAt: params.gatewayStartedAt,
+    caughtUpAt: params.caughtUpAt ?? null,
     recentEventIds: (params.recentEventIds ?? []).filter((x): x is string => typeof x === "string"),
     recentRumorIds: (params.recentRumorIds ?? []).filter(
       (x): x is string => typeof x === "string",

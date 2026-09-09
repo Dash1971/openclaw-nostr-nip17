@@ -59,4 +59,38 @@ describe("claimed ID tracker", () => {
     restarted.release("first");
     restarted.stop();
   });
+
+  it("extends retention when a later duplicate is observed", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_800_000_000_000);
+    const retentionMs = 2 * 24 * 60 * 60 * 1000;
+    const tracker = createClaimedIdTracker({
+      maxEntries: 1,
+      ttlMs: 60 * 60 * 1000,
+      retentionMs,
+      pruneIntervalMs: 60_000,
+    });
+
+    expect(tracker.claim("rumor")).toBe("claimed");
+    tracker.complete("rumor");
+    vi.advanceTimersByTime(24 * 60 * 60 * 1000);
+    expect(tracker.claim("rumor")).toBe("processed");
+
+    const persisted = tracker.snapshotPersisted();
+    tracker.stop();
+    const restarted = createClaimedIdTracker({
+      maxEntries: 1,
+      ttlMs: 60 * 60 * 1000,
+      retentionMs,
+      pruneIntervalMs: 60_000,
+    });
+    restarted.seedPersisted(persisted);
+    vi.advanceTimersByTime(24 * 60 * 60 * 1000 + 1);
+    expect(restarted.claim("rumor")).toBe("processed");
+
+    vi.advanceTimersByTime(retentionMs + 1);
+    expect(restarted.claim("rumor")).toBe("claimed");
+    restarted.release("rumor");
+    restarted.stop();
+  });
 });

@@ -19,16 +19,11 @@ const health = (state: SubscriptionHealth["state"], overrides: Partial<Subscript
 afterEach(() => vi.useRealTimers());
 
 describe("aggregate Nostr bus health", () => {
-  it("keeps reconnect overlap bounded after a long idle period", () => {
-    const nowSec = 1_800_000_000;
+  it("preserves the durable catch-up boundary across a long outage", () => {
+    const caughtUpAt = 1_800_000_000 - 30 * 24 * 60 * 60;
     const twoDaysAndFiveMinutes = 2 * 24 * 60 * 60 + 300;
 
-    expect(computeReplaySinceTimestamp(nowSec - 30 * 24 * 60 * 60, nowSec)).toBe(
-      nowSec - twoDaysAndFiveMinutes,
-    );
-    expect(computeReplaySinceTimestamp(nowSec + 60, nowSec)).toBe(
-      nowSec + 60 - twoDaysAndFiveMinutes,
-    );
+    expect(computeReplaySinceTimestamp(caughtUpAt)).toBe(caughtUpAt - twoDaysAndFiveMinutes);
   });
 
   it("reports degraded with partial relay coverage and unhealthy with none", () => {

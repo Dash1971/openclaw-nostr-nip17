@@ -1,6 +1,6 @@
 # Nostr NIP-17 reconnect hardening review brief
 
-Status: implementation revised for independent re-review; merge and deployment are not approved by this document. See [the independent review](20260909_independent_review.md) and [the implementation follow-up](20260909_v0_review_followup.md).
+Status: implementation revised for another independent re-review; merge and deployment are not approved by this document. See [the independent review](20260909_independent_review.md), [the first implementation follow-up](20260909_v0_review_followup.md), and [the second review follow-up](20260909_v1_review_followup.md).
 
 ## References
 

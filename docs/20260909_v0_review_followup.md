@@ -1,6 +1,6 @@
 # Reconnect hardening review follow-up
 
-Status: implementation candidate ready for independent re-review. This document does not approve merge or deployment. Reviewers should pin the exact PR head commit rather than relying on a moving branch name.
+Status: reviewed as commit `683f66e38223e116b95bbdb1a1e5007a6d17d5fa`; further changes were requested. See [the second review follow-up](20260909_v1_review_followup.md). This document does not approve merge or deployment.
 
 ## Scope
 
