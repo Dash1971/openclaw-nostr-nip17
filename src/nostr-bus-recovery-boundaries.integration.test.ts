@@ -50,6 +50,56 @@ function createBoundaryWrap(params: {
   }
 }
 
+async function createGenerationReplacementRelay(event: Event): Promise<{
+  url: string;
+  giftWrapRequestCount: () => number;
+  close: () => Promise<void>;
+}> {
+  const server = createServer();
+  const relay = new WebSocketServer({ server });
+  let giftWrapRequests = 0;
+  relay.on("connection", (socket) => {
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString()) as unknown[];
+      if (message[0] === "EVENT") {
+        const published = message[1] as Event;
+        socket.send(JSON.stringify(["OK", published.id, true, "accepted"]));
+      }
+      if (message[0] === "REQ" && typeof message[1] === "string") {
+        const filter = message[2] as { kinds?: number[] } | undefined;
+        if (!filter?.kinds?.includes(1059)) {
+          socket.send(JSON.stringify(["EOSE", message[1]]));
+          return;
+        }
+        giftWrapRequests += 1;
+        socket.send(JSON.stringify(["EVENT", message[1], event]));
+        if (giftWrapRequests === 1) {
+          socket.send(JSON.stringify(["CLOSED", message[1], "forced generation replacement"]));
+        } else {
+          socket.send(JSON.stringify(["EOSE", message[1]]));
+        }
+      }
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Relay did not expose a port");
+  return {
+    url: `ws://127.0.0.1:${address.port}`,
+    giftWrapRequestCount: () => giftWrapRequests,
+    close: async () => {
+      for (const socket of relay.clients) socket.terminate();
+      await new Promise<void>((resolve) => relay.close(() => resolve()));
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+    },
+  };
+}
+
 describe("Nostr bus recovery boundaries", () => {
   let stateDir: string;
 
@@ -433,6 +483,186 @@ describe("Nostr bus recovery boundaries", () => {
       await new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
       });
+    }
+  });
+
+  it("waits for a retired generation handler before advancing after reconnect", async () => {
+    const nowMs = Date.now();
+    const caughtUpAt = Math.floor(nowMs / 1000) - 60 * 60;
+    const recipientKey = generateSecretKey();
+    const event = createBoundaryWrap({
+      recipientPubkey: getPublicKey(recipientKey),
+      senderKey: generateSecretKey(),
+      nowMs,
+      content: "retired generation success",
+    });
+    await writeNostrBusState({
+      accountId: "retired-generation-success",
+      lastProcessedAt: caughtUpAt,
+      gatewayStartedAt: caughtUpAt,
+      caughtUpAt,
+    });
+    const relay = await createGenerationReplacementRelay(event);
+    let releaseHandler!: () => void;
+    const handlerGate = new Promise<void>((resolve) => {
+      releaseHandler = resolve;
+    });
+    let handlerStarted = false;
+    let handlerCompleted = false;
+    const bus = await startNostrBus({
+      accountId: "retired-generation-success",
+      privateKey: Buffer.from(recipientKey).toString("hex"),
+      relays: [relay.url],
+      statePersistIntervalMs: 50,
+      onMessage: async () => {
+        handlerStarted = true;
+        await handlerGate;
+        handlerCompleted = true;
+      },
+    });
+
+    try {
+      await waitFor(() => handlerStarted && relay.giftWrapRequestCount() >= 2);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const whilePending = await readNostrBusState({ accountId: "retired-generation-success" });
+      expect(whilePending?.caughtUpAt).toBe(caughtUpAt);
+      expect(whilePending?.processedRumorIds ?? []).toEqual([]);
+
+      releaseHandler();
+      await waitFor(() => handlerCompleted);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const completed = await readNostrBusState({ accountId: "retired-generation-success" });
+      expect(completed?.caughtUpAt).toBeGreaterThan(caughtUpAt);
+      expect(completed?.processedRumorIds).toHaveLength(1);
+    } finally {
+      releaseHandler();
+      await bus.close();
+      await relay.close();
+    }
+  });
+
+  it("keeps a retired generation failure retryable after reconnect and restart", async () => {
+    const nowMs = Date.now();
+    const caughtUpAt = Math.floor(nowMs / 1000) - 60 * 60;
+    const recipientKey = generateSecretKey();
+    const event = createBoundaryWrap({
+      recipientPubkey: getPublicKey(recipientKey),
+      senderKey: generateSecretKey(),
+      nowMs,
+      content: "retired generation retry",
+    });
+    await writeNostrBusState({
+      accountId: "retired-generation-failure",
+      lastProcessedAt: caughtUpAt,
+      gatewayStartedAt: caughtUpAt,
+      caughtUpAt,
+    });
+    const relay = await createGenerationReplacementRelay(event);
+    let releaseHandler!: () => void;
+    const handlerGate = new Promise<void>((resolve) => {
+      releaseHandler = resolve;
+    });
+    let failed = false;
+    const failing = await startNostrBus({
+      accountId: "retired-generation-failure",
+      privateKey: Buffer.from(recipientKey).toString("hex"),
+      relays: [relay.url],
+      statePersistIntervalMs: 50,
+      onMessage: async () => {
+        await handlerGate;
+        failed = true;
+        throw new Error("retired generation transient failure");
+      },
+    });
+
+    try {
+      await waitFor(() => relay.giftWrapRequestCount() >= 2);
+      releaseHandler();
+      await waitFor(() => failed);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const failedState = await readNostrBusState({ accountId: "retired-generation-failure" });
+      expect(failedState?.caughtUpAt).toBe(caughtUpAt);
+      expect(failedState?.processedRumorIds ?? []).toEqual([]);
+    } finally {
+      releaseHandler();
+      await failing.close();
+    }
+
+    let recovered = 0;
+    const replacement = await startNostrBus({
+      accountId: "retired-generation-failure",
+      privateKey: Buffer.from(recipientKey).toString("hex"),
+      relays: [relay.url],
+      onMessage: async () => {
+        recovered += 1;
+      },
+    });
+    try {
+      await waitFor(() => recovered === 1);
+    } finally {
+      await replacement.close();
+      await relay.close();
+    }
+  });
+
+  it("preserves the retired generation boundary when shutdown abandons its handler", async () => {
+    const nowMs = Date.now();
+    const caughtUpAt = Math.floor(nowMs / 1000) - 60 * 60;
+    const recipientKey = generateSecretKey();
+    const event = createBoundaryWrap({
+      recipientPubkey: getPublicKey(recipientKey),
+      senderKey: generateSecretKey(),
+      nowMs,
+      content: "retired generation abandoned",
+    });
+    await writeNostrBusState({
+      accountId: "retired-generation-abandoned",
+      lastProcessedAt: caughtUpAt,
+      gatewayStartedAt: caughtUpAt,
+      caughtUpAt,
+    });
+    const relay = await createGenerationReplacementRelay(event);
+    let releaseHandler!: () => void;
+    const handlerGate = new Promise<void>((resolve) => {
+      releaseHandler = resolve;
+    });
+    let handlerStarted = false;
+    const abandoned = await startNostrBus({
+      accountId: "retired-generation-abandoned",
+      privateKey: Buffer.from(recipientKey).toString("hex"),
+      relays: [relay.url],
+      statePersistIntervalMs: 50,
+      shutdownDrainMs: 100,
+      onMessage: async () => {
+        handlerStarted = true;
+        await handlerGate;
+      },
+    });
+
+    await waitFor(() => handlerStarted && relay.giftWrapRequestCount() >= 2);
+    const closeStartedAt = Date.now();
+    await abandoned.close();
+    expect(Date.now() - closeStartedAt).toBeLessThan(1_000);
+    const afterClose = await readNostrBusState({ accountId: "retired-generation-abandoned" });
+    expect(afterClose?.caughtUpAt).toBe(caughtUpAt);
+    expect(afterClose?.processedRumorIds ?? []).toEqual([]);
+    releaseHandler();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    let recovered = 0;
+    const replacement = await startNostrBus({
+      accountId: "retired-generation-abandoned",
+      privateKey: Buffer.from(recipientKey).toString("hex"),
+      relays: [relay.url],
+      onMessage: async () => {
+        recovered += 1;
+      },
+    });
+    try {
+      await waitFor(() => recovered === 1);
+    } finally {
+      await replacement.close();
+      await relay.close();
     }
   });
 

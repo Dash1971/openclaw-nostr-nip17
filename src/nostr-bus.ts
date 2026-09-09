@@ -1000,9 +1000,36 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
     pending: Set<Promise<unknown>>;
   };
   const relayCatchUp = new Map<string, RelayCatchUpGeneration>();
+  // A reconnect replaces the relay's transport generation, but handlers that
+  // began under the retired generation still own delivery obligations. Keep
+  // those operations in the checkpoint barrier until their actual outcome is
+  // known; a duplicate observed by the replacement generation is not proof of
+  // successful delivery.
+  const retiredCatchUpPending = new Set<Promise<unknown>>();
+  const retainRetiredCatchUpOperation = (operation: Promise<unknown>) => {
+    if (retiredCatchUpPending.has(operation)) return;
+    retiredCatchUpPending.add(operation);
+    void operation.then(
+      () => {
+        retiredCatchUpPending.delete(operation);
+        tryAdvanceCatchUpCheckpoint();
+      },
+      () => {
+        retiredCatchUpPending.delete(operation);
+        tryAdvanceCatchUpCheckpoint();
+      },
+    );
+  };
   const publishAggregateHealth = () => options.onHealth?.(aggregateSubscriptionHealth(relays, relayHealth));
   const tryAdvanceCatchUpCheckpoint = () => {
-    if (closing || lifecycleClosed || retryableEventIds.size > 0) return;
+    if (
+      closing ||
+      lifecycleClosed ||
+      retryableEventIds.size > 0 ||
+      retiredCatchUpPending.size > 0
+    ) {
+      return;
+    }
     const current = relays.flatMap((relay) => {
       const health = relayHealth.get(relay);
       const catchUp = relayCatchUp.get(relay);
@@ -1085,7 +1112,11 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
       },
       onStateChange: (health) => {
         relayHealth.set(relay, health);
-        if (relayCatchUp.get(relay)?.generation !== health.generation) {
+        const retired = relayCatchUp.get(relay);
+        if (retired && retired.generation !== health.generation) {
+          for (const operation of retired.pending) {
+            retainRetiredCatchUpOperation(operation);
+          }
           relayCatchUp.delete(relay);
         }
         publishAggregateHealth();
