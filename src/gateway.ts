@@ -54,11 +54,11 @@ export function buildNostrListenerStatus<
       : null,
     lastError: health.lastError,
     lastInboundAt: health.lastEventAt,
-    lastTransportActivityAt:
-      health.lastEventAt ??
-      health.lastEoseAt ??
-      health.lastConnectedAt ??
-      previous.lastTransportActivityAt,
+    // nostr-tools does not expose ping/pong timestamps. Reporting message,
+    // EOSE, or connection timestamps as transport heartbeat activity makes a
+    // healthy idle relay look stale to the host after 30 minutes. Null tells
+    // the host to rely on the explicit connected/health state instead.
+    lastTransportActivityAt: null,
   };
 }
 
@@ -152,6 +152,7 @@ export const startNostrGatewayAccount: NostrGatewayStart = async (ctx) => {
     });
 
   let busHandle: NostrBusHandle | null = null;
+  let shutdownPromise: Promise<void> | null = null;
 
   const updateListenerStatus = (health: NostrBusHealth) => {
     const previous = ctx.getStatus();
@@ -319,19 +320,30 @@ export const startNostrGatewayAccount: NostrGatewayStart = async (ctx) => {
             return;
           }
           stopped = true;
-          bus.close();
-          if (busHandle === bus) {
-            busHandle = null;
-          }
-          if (activeBuses.get(account.accountId) === bus) {
-            activeBuses.delete(account.accountId);
-          }
-          metricsSnapshots.delete(account.accountId);
-          ctx.log?.info?.(`[${account.accountId}] Nostr provider stopped`);
+          shutdownPromise = bus
+            .close()
+            .catch((error: unknown) => {
+              ctx.log?.error?.(
+                `[${account.accountId}] failed to close Nostr provider cleanly: ${String(error)}`,
+              );
+            })
+            .then(() => {
+              if (busHandle === bus) {
+                busHandle = null;
+              }
+              if (activeBuses.get(account.accountId) === bus) {
+                activeBuses.delete(account.accountId);
+              }
+              metricsSnapshots.delete(account.accountId);
+              ctx.log?.info?.(`[${account.accountId}] Nostr provider stopped`);
+            });
         },
       };
     },
   });
+  if (shutdownPromise) {
+    await shutdownPromise;
+  }
 };
 
 export const nostrPairingTextAdapter = {

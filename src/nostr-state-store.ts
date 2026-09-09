@@ -3,12 +3,13 @@ import { getNostrRuntime } from "./runtime.js";
 import { normalizeNostrStateAccountId } from "./state-account-id.js";
 import { readTextFileIfExists, writeJsonFileSecure } from "openclaw/plugin-sdk/security-runtime";
 import path from "node:path";
+import type { PersistedClaimedId } from "./claimed-id-tracker.js";
 
-const STORE_VERSION = 3;
+const STORE_VERSION = 4;
 const PROFILE_STATE_VERSION = 1;
 
 type NostrBusState = {
-  version: 2 | 3;
+  version: 2 | 3 | 4;
   /** Unix timestamp (seconds) of the last processed event */
   lastProcessedAt: number | null;
   /** Gateway startup timestamp (seconds) - events before this are old */
@@ -17,6 +18,8 @@ type NostrBusState = {
   recentEventIds: string[];
   /** Recent authenticated rumor IDs for dedupe across gift wraps and restarts */
   recentRumorIds?: string[];
+  /** Timestamped authenticated rumor IDs retained for the complete subscription overlap */
+  processedRumorIds?: PersistedClaimedId[];
 };
 
 /** Profile publish state (separate from bus state) */
@@ -73,6 +76,7 @@ export async function writeNostrBusState(params: {
   gatewayStartedAt: number;
   recentEventIds?: string[];
   recentRumorIds?: string[];
+  processedRumorIds?: PersistedClaimedId[];
   env?: NodeJS.ProcessEnv;
 }): Promise<void> {
   const payload: NostrBusState = {
@@ -82,6 +86,13 @@ export async function writeNostrBusState(params: {
     recentEventIds: (params.recentEventIds ?? []).filter((x): x is string => typeof x === "string"),
     recentRumorIds: (params.recentRumorIds ?? []).filter(
       (x): x is string => typeof x === "string",
+    ),
+    processedRumorIds: (params.processedRumorIds ?? []).filter(
+      (entry): entry is PersistedClaimedId =>
+        typeof entry?.id === "string" &&
+        Boolean(entry.id) &&
+        typeof entry.processedAt === "number" &&
+        Number.isFinite(entry.processedAt),
     ),
   };
   writeStateFile(

@@ -1,6 +1,6 @@
 # Nostr NIP-17 reconnect hardening review brief
 
-Status: implementation under independent review; merge and deployment are not approved by this document. See [the independent review](20260909_independent_review.md) for outstanding defects.
+Status: implementation revised for independent re-review; merge and deployment are not approved by this document. See [the independent review](20260909_independent_review.md) and [the implementation follow-up](20260909_v0_review_followup.md).
 
 ## References
 
@@ -31,27 +31,20 @@ Outbound delivery previously returned after the first eligible relay accepted th
 
 ## Review status
 
-Independent review confirmed the partial-coverage connectivity fix and identified unresolved idle-health and replay-retention problems. The startup timeout, full shutdown behavior, and interaction with the host lifecycle also require appropriate integration evidence. Adding persisted rumor IDs does not by itself establish replay protection beyond cache expiration.
+Independent review confirmed the partial-coverage connectivity fix and identified idle-health, replay-retention, ownership, and shutdown problems. The current candidate responds with explicit null transport-heartbeat semantics, timestamped durable rumor retention, corrected claim ownership, and awaited full-pool shutdown. These corrections and their new tests still require independent confirmation.
 
 The implementation retains NIP-17 verification, encryption, sender policy, TOTP gating, size/rate limits, and publication circuit breakers. This statement describes intended preservation, not a complete security audit.
 
 ## Validation reported by the implementation author
 
-Against Node 24 and locked dependencies:
-- 27 tests passed across nine files.
-- TypeScript check passed.
-- Diff whitespace check passed.
-- A controlled local WebSocket test verifies recovery of one failed endpoint while another stays connected, followed by explicit stop.
-
-The independent reviewer inspected the tests and ran focused source-based checks, but did not rerun the complete suite. The supervisor test is not a full gateway, persistence, or end-to-end transport validation.
+The earlier candidate reported 27 passing tests across nine files, a passing TypeScript check, a clean diff check, and a controlled local WebSocket reconnect test. Updated validation totals for the current candidate are recorded in the follow-up commit and PR checks; the independent reviewer has not yet assessed them.
 
 ## Review priorities
 
-1. Correct idle transport liveness and timestamp precedence.
-2. Align replay retention with reconnect lookback, capacity eviction, and restart boundaries.
-3. Correct in-flight entry ownership and test full-handler deduplication.
-4. Test startup/abort, pending replies, discovered-relay cleanup, and shutdown.
-5. Make the externally supervised deployment contract explicit across all lifecycle entry points.
-6. Keep implementation commits immutable for review and stage outside active plugin paths.
+1. Re-review idle transport semantics and timestamp handling.
+2. Re-review replay retention across lookback, eviction, expiry, and restart boundaries.
+3. Re-review in-flight ownership and awaited full-pool shutdown.
+4. Make the externally supervised deployment contract explicit across all lifecycle entry points in private deployment work.
+5. Keep the resulting implementation commit immutable for review and stage outside active plugin paths.
 
 Deployment-specific procedures, logs, privileged command details, and approvals belong in a private operator runbook.

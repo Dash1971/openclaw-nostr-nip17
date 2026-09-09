@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { aggregateSubscriptionHealth } from "./nostr-bus.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { aggregateSubscriptionHealth, computeReplaySinceTimestamp } from "./nostr-bus.js";
 import { buildNostrListenerStatus } from "./gateway.js";
 import type { SubscriptionHealth } from "./subscription-supervisor.js";
 
@@ -16,7 +16,21 @@ const health = (state: SubscriptionHealth["state"], overrides: Partial<Subscript
   ...overrides,
 });
 
+afterEach(() => vi.useRealTimers());
+
 describe("aggregate Nostr bus health", () => {
+  it("keeps reconnect overlap bounded after a long idle period", () => {
+    const nowSec = 1_800_000_000;
+    const twoDaysAndFiveMinutes = 2 * 24 * 60 * 60 + 300;
+
+    expect(computeReplaySinceTimestamp(nowSec - 30 * 24 * 60 * 60, nowSec)).toBe(
+      nowSec - twoDaysAndFiveMinutes,
+    );
+    expect(computeReplaySinceTimestamp(nowSec + 60, nowSec)).toBe(
+      nowSec + 60 - twoDaysAndFiveMinutes,
+    );
+  });
+
   it("reports degraded with partial relay coverage and unhealthy with none", () => {
     const relays = ["wss://one", "wss://two", "wss://three"];
     const states = new Map<string, SubscriptionHealth>([
@@ -37,7 +51,7 @@ describe("aggregate Nostr bus health", () => {
     });
   });
 
-  it("keeps partial relay coverage connected while preserving degraded health", () => {
+  it("keeps partial relay coverage connected without fabricating transport heartbeat activity", () => {
     const status = buildNostrListenerStatus(
       { lastTransportActivityAt: 5 },
       { accountId: "default", publicKey: "public-key" },
@@ -60,7 +74,38 @@ describe("aggregate Nostr bus health", () => {
       connected: true,
       statusState: "degraded",
       healthState: "degraded",
-      lastTransportActivityAt: 10,
+      lastTransportActivityAt: null,
+    });
+  });
+
+  it("does not reuse old message activity after the host stale threshold or a fresh reconnect", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_800_000_000_000);
+    const oldMessageAt = Date.now();
+    vi.advanceTimersByTime(31 * 60 * 1000);
+
+    const status = buildNostrListenerStatus(
+      { lastTransportActivityAt: oldMessageAt },
+      { accountId: "default", publicKey: "public-key" },
+      {
+        state: "healthy",
+        connectedRelays: 1,
+        totalRelays: 1,
+        reconnectAttempts: 0,
+        lastConnectedAt: Date.now(),
+        lastDisconnectedAt: Date.now() - 1,
+        lastEventAt: oldMessageAt,
+        lastEoseAt: Date.now(),
+        lastError: null,
+        relays: {},
+      },
+    );
+
+    expect(status).toMatchObject({
+      connected: true,
+      healthState: "healthy",
+      lastConnectedAt: Date.now(),
+      lastTransportActivityAt: null,
     });
   });
 });

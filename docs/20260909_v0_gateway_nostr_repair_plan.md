@@ -1,6 +1,6 @@
 # Gateway lifecycle and Nostr recovery: public design requirements
 
-Status: design under review. This document is generic deployment guidance, not an operator runbook or authorization to change a running service. See [the independent review](20260909_independent_review.md) for unresolved findings.
+Status: design under review. This document is generic deployment guidance, not an operator runbook or authorization to change a running service. The implementation response to the independent review is summarized in [the review follow-up](20260909_v0_review_followup.md).
 
 ## Review references
 
@@ -19,7 +19,7 @@ A gateway should have one deliberate supervisor. Its lifecycle commands must add
 
 ## Requirements before deployment
 
-1. Fix and test the outstanding idle-health and replay-retention defects in the independent review.
+1. Obtain independent confirmation that the idle-health, replay-retention, ownership, and shutdown corrections in the review follow-up satisfy the findings.
 2. Inventory lifecycle entry points, including service repair, direct start/restart/install, updates, internal restart requests, and configuration reload. Establish which are permitted and how they reach the intended supervisor.
 3. Do not treat OPENCLAW_SERVICE_REPAIR_POLICY=external as a global restart guard. The reviewed host implementation applies it to doctor service repair; other restart paths require separate handling.
 4. Verify environment inheritance for each actual launcher. Editing a persistent environment source does not update a process that is already running.
@@ -58,7 +58,7 @@ The candidate should demonstrate:
 6. Total listener-loss reporting and bounded retry.
 7. Idle transport health beyond the host's stale threshold.
 8. Clean shutdown during startup, reconnect, and an in-flight handler.
-9. Deterministic tests beyond the 30-minute health and one-hour dedupe thresholds, plus a deliberately designed observation window exceeding both. A 75–90-minute window is a starting point, not a substitute for those tests.
+9. Deterministic tests beyond the 30-minute health and one-hour dedupe thresholds, plus a deliberately designed observation window exceeding both. A 75–90-minute window is a starting point, not a substitute for those tests. The deterministic boundary tests are part of the current review candidate; the observation window remains a deployment acceptance gate.
 
 Use controlled local relays for fault injection. If any end-to-end scenario is not exercised, state that limitation instead of treating supervisor-only tests as complete gateway validation.
 

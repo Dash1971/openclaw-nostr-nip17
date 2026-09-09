@@ -51,7 +51,19 @@ import {
 const STARTUP_LOOKBACK_SEC = 2 * 24 * 60 * 60 + 300; // NIP-59 timestamps are randomized up to 2 days
 const MAX_PERSISTED_EVENT_IDS = 5000;
 const STATE_PERSIST_DEBOUNCE_MS = 5000; // Debounce state writes
+const DEFAULT_REPLAY_RETENTION_MS = (STARTUP_LOOKBACK_SEC + 300) * 1000;
 const DEFAULT_INBOUND_GUARD_POLICY = createDirectDmPreCryptoGuardPolicy();
+
+export function computeReplaySinceTimestamp(
+  lastProcessedAt: number,
+  nowSec: number = Math.floor(Date.now() / 1000),
+): number {
+  // A newly produced NIP-59 gift wrap may be backdated by up to two days.
+  // Anchor the overlap to current time so an idle process does not expand its
+  // replay query indefinitely, while retaining lastProcessedAt as protection
+  // against a local clock moving backwards.
+  return Math.max(0, Math.max(lastProcessedAt, nowSec) - STARTUP_LOOKBACK_SEC);
+}
 
 // Circuit breaker configuration
 const CIRCUIT_BREAKER_THRESHOLD = 5; // failures before opening
@@ -206,8 +218,10 @@ interface NostrBusOptions {
   onHealth?: (health: NostrBusHealth) => void;
   /** Maximum entries in seen tracker (default: 100,000) */
   maxSeenEntries?: number;
-  /** Seen tracker TTL in ms (default: 1 hour) */
+  /** Seen tracker TTL in ms (default: complete NIP-59 subscription overlap) */
   seenTtlMs?: number;
+  /** Durable verified-rumor retention (never shorter than seenTtlMs) */
+  replayRetentionMs?: number;
 }
 
 type FixedWindowRateLimiter = {
@@ -268,7 +282,7 @@ function createFixedWindowRateLimiter(params: {
 
 export interface NostrBusHandle {
   /** Stop the bus and close relay connections */
-  close: () => void;
+  close: () => Promise<void>;
   /** Get the bot's public key */
   publicKey: string;
   /** Send a DM to a pubkey */
@@ -481,8 +495,12 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
     onEose,
     onMetric,
     maxSeenEntries = 100_000,
-    seenTtlMs = 60 * 60 * 1000,
+    seenTtlMs = DEFAULT_REPLAY_RETENTION_MS,
   } = options;
+  const replayRetentionMs = Math.max(
+    seenTtlMs,
+    Math.floor(options.replayRetentionMs ?? DEFAULT_REPLAY_RETENTION_MS),
+  );
 
   const sk = validatePrivateKey(privateKey);
   const pk = getPublicKey(sk);
@@ -509,6 +527,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
   const rumors = createClaimedIdTracker({
     maxEntries: maxSeenEntries,
     ttlMs: seenTtlMs,
+    retentionMs: replayRetentionMs,
   });
 
   // Initialize circuit breakers and health tracker
@@ -521,14 +540,13 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
 
   // Read persisted state and compute `since` timestamp (with small overlap)
   const state = await readNostrBusState({ accountId });
-  const baseSince = computeSinceTimestamp(state, gatewayStartedAt);
-  const since = Math.max(0, baseSince - STARTUP_LOOKBACK_SEC);
-
   // Seed in-memory dedupe with recent IDs from disk (prevents restart replay)
   if (state?.recentEventIds?.length) {
     seen.seed(state.recentEventIds);
   }
-  if (state?.recentRumorIds?.length) {
+  if (state?.processedRumorIds?.length) {
+    rumors.seedPersisted(state.processedRumorIds);
+  } else if (state?.recentRumorIds?.length) {
     rumors.seed(state.recentRumorIds);
   }
 
@@ -539,10 +557,12 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
     gatewayStartedAt,
     recentEventIds: state?.recentEventIds ?? [],
     recentRumorIds: state?.recentRumorIds ?? [],
+    processedRumorIds: rumors.snapshotPersisted(),
   });
 
   // Debounced state persistence
   let pendingWrite: ReturnType<typeof setTimeout> | undefined;
+  let pendingPersist: Promise<void> | null = null;
   let lastProcessedAt = state?.lastProcessedAt ?? gatewayStartedAt;
   let recentEventIds = (state?.recentEventIds ?? []).slice(-MAX_PERSISTED_EVENT_IDS);
   let recentRumorIds = (state?.recentRumorIds ?? []).slice(-MAX_PERSISTED_EVENT_IDS);
@@ -570,17 +590,38 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
       clearTimeout(pendingWrite);
     }
     pendingWrite = setTimeout(() => {
-      writeNostrBusState({
+      pendingWrite = undefined;
+      pendingPersist = writeNostrBusState({
         accountId,
         lastProcessedAt,
         gatewayStartedAt,
         recentEventIds,
         recentRumorIds,
-      }).catch((err: unknown) => onError?.(err as Error, "persist state"));
+        processedRumorIds: rumors.snapshotPersisted(),
+      })
+        .catch((err: unknown) => onError?.(err as Error, "persist state"))
+        .finally(() => {
+          pendingPersist = null;
+        });
     }, STATE_PERSIST_DEBOUNCE_MS);
   }
 
   const inflight = new Set<string>();
+  const activeOperations = new Set<Promise<unknown>>();
+  let closing = false;
+  let closePromise: Promise<void> | null = null;
+  const trackOperation = <T>(operation: () => Promise<T>): Promise<T> => {
+    if (closing) {
+      return Promise.reject(new Error("Nostr bus is closing"));
+    }
+    const promise = operation();
+    activeOperations.add(promise);
+    void promise.then(
+      () => activeOperations.delete(promise),
+      () => activeOperations.delete(promise),
+    );
+    return promise;
+  };
   const perSenderRateLimiter = createFixedWindowRateLimiter({
     windowMs: guardPolicy.rateLimit.windowMs,
     maxRequests: guardPolicy.rateLimit.maxPerSenderPerWindow,
@@ -602,6 +643,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
   // Event handler
   async function handleEvent(event: Event): Promise<void> {
     let claimedRumorId: string | null = null;
+    let ownsEventClaim = false;
     try {
       metrics.emit("event.received");
 
@@ -611,6 +653,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
         return;
       }
       inflight.add(event.id);
+      ownsEventClaim = true;
 
       const markSeen = () => {
         seen.add(event.id);
@@ -626,6 +669,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
       };
 
       // Skip events older than our `since` (relay may ignore filter)
+      const since = computeReplaySinceTimestamp(lastProcessedAt);
       if (event.created_at < since) {
         rejectAndMarkSeen("event.rejected.stale");
         return;
@@ -794,7 +838,9 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
       if (claimedRumorId) {
         rumors.release(claimedRumorId);
       }
-      inflight.delete(event.id);
+      if (ownsEventClaim) {
+        inflight.delete(event.id);
+      }
     }
   }
 
@@ -811,20 +857,25 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
     relays.map((relay) => publishEventWithNip42Auth(pool, relay, inboxRelayEvent, sk)),
   );
 
-  const dmFilter = { kinds: [NIP17_GIFT_WRAP_KIND], "#p": [pk], since } satisfies Parameters<
-    typeof pool.subscribeMany
-  >[1];
+  const buildDmFilter = () =>
+    ({
+      kinds: [NIP17_GIFT_WRAP_KIND],
+      "#p": [pk],
+      since: computeReplaySinceTimestamp(lastProcessedAt),
+    }) satisfies Parameters<typeof pool.subscribeMany>[1];
   const relayHealth = new Map<string, SubscriptionHealth>();
   const publishAggregateHealth = () => options.onHealth?.(aggregateSubscriptionHealth(relays, relayHealth));
   const subscriptions = relays.map((relay) =>
     createSubscriptionSupervisor<Event>({
       subscribe: (callbacks) =>
-        pool.subscribeMany([relay], dmFilter, {
+        pool.subscribeMany([relay], buildDmFilter(), {
           ...callbacks,
           onauth: async (authEvent) => finalizeEvent(authEvent, sk),
         }),
       onEvent: (event) => {
-        void handleEvent(event);
+        void trackOperation(() => handleEvent(event)).catch((error: unknown) => {
+          if (!closing) onError?.(error as Error, `event ${event.id}`);
+        });
       },
       onEose: () => {
         metrics.emit("relay.message.eose", 1, { relay });
@@ -850,46 +901,50 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
 
   // Public sendDm function
   const sendDm = async (toPubkey: string, text: string): Promise<void> => {
-    await sendEncryptedDm(
-      pool,
-      sk,
-      toPubkey,
-      text,
-      relays,
-      metrics,
-      circuitBreakers,
-      healthTracker,
-      onError,
+    await trackOperation(() =>
+      sendEncryptedDm(
+        pool,
+        sk,
+        toPubkey,
+        text,
+        relays,
+        metrics,
+        circuitBreakers,
+        healthTracker,
+        onError,
+      ),
     );
   };
 
   // Profile publishing function
   const publishProfile = async (profile: NostrProfile): Promise<ProfilePublishResult> => {
-    // Read last published timestamp for monotonic ordering
-    const profileState = await readNostrProfileState({ accountId });
-    const lastPublishedAt = profileState?.lastPublishedAt ?? undefined;
+    return await trackOperation(async () => {
+      // Read last published timestamp for monotonic ordering
+      const profileState = await readNostrProfileState({ accountId });
+      const lastPublishedAt = profileState?.lastPublishedAt ?? undefined;
 
-    // Publish the profile
-    const result = await publishProfileFn(pool, sk, relays, profile, lastPublishedAt);
+      // Publish the profile
+      const result = await publishProfileFn(pool, sk, relays, profile, lastPublishedAt);
 
-    // Convert results to state format
-    const publishResults: Record<string, "ok" | "failed" | "timeout"> = {};
-    for (const relay of result.successes) {
-      publishResults[relay] = "ok";
-    }
-    for (const { relay, error } of result.failures) {
-      publishResults[relay] = error === "timeout" ? "timeout" : "failed";
-    }
+      // Convert results to state format
+      const publishResults: Record<string, "ok" | "failed" | "timeout"> = {};
+      for (const relay of result.successes) {
+        publishResults[relay] = "ok";
+      }
+      for (const { relay, error } of result.failures) {
+        publishResults[relay] = error === "timeout" ? "timeout" : "failed";
+      }
 
-    // Persist the publish state
-    await writeNostrProfileState({
-      accountId,
-      lastPublishedAt: result.createdAt,
-      lastPublishedEventId: result.eventId,
-      lastPublishResults: publishResults,
+      // Persist the publish state
+      await writeNostrProfileState({
+        accountId,
+        lastPublishedAt: result.createdAt,
+        lastPublishedEventId: result.eventId,
+        lastPublishResults: publishResults,
+      });
+
+      return result;
     });
-
-    return result;
   };
 
   // Get profile state function
@@ -904,23 +959,35 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
 
   return {
     close: () => {
-      for (const subscription of subscriptions) subscription.stop();
-      pool.close(relays);
-      seen.stop();
-      rumors.stop();
-      perSenderRateLimiter.clear();
-      globalRateLimiter.clear();
-      // Flush pending state write synchronously on close
-      if (pendingWrite) {
-        clearTimeout(pendingWrite);
-        writeNostrBusState({
+      if (closePromise) return closePromise;
+      closing = true;
+      closePromise = (async () => {
+        for (const subscription of subscriptions) subscription.stop();
+        while (activeOperations.size > 0) {
+          await Promise.allSettled([...activeOperations]);
+        }
+        if (pendingWrite) {
+          clearTimeout(pendingWrite);
+          pendingWrite = undefined;
+        }
+        if (pendingPersist) {
+          await pendingPersist;
+        }
+        await writeNostrBusState({
           accountId,
           lastProcessedAt,
           gatewayStartedAt,
           recentEventIds,
           recentRumorIds,
+          processedRumorIds: rumors.snapshotPersisted(),
         }).catch((err: unknown) => onError?.(err as Error, "persist state on close"));
-      }
+        pool.destroy();
+        seen.stop();
+        rumors.stop();
+        perSenderRateLimiter.clear();
+        globalRateLimiter.clear();
+      })();
+      return closePromise;
     },
     publicKey: pk,
     sendDm,
