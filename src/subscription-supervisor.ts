@@ -35,6 +35,7 @@ export function createSubscriptionSupervisor<EventType>(options: {
   maxDelayMs?: number;
   jitterRatio?: number;
   connectionTimeoutMs?: number;
+  stabilityResetMs?: number;
   now?: () => number;
   random?: () => number;
   schedule?: (callback: () => void, delayMs: number) => TimerHandle;
@@ -44,6 +45,7 @@ export function createSubscriptionSupervisor<EventType>(options: {
   const maxDelayMs = Math.max(baseDelayMs, Math.floor(options.maxDelayMs ?? 60_000));
   const jitterRatio = Math.max(0, Math.min(1, options.jitterRatio ?? 0.2));
   const connectionTimeoutMs = Math.max(1, Math.floor(options.connectionTimeoutMs ?? 30_000));
+  const stabilityResetMs = Math.max(1, Math.floor(options.stabilityResetMs ?? 30_000));
   const now = options.now ?? Date.now;
   const random = options.random ?? Math.random;
   const schedule = options.schedule ?? ((callback, delayMs) => setTimeout(callback, delayMs));
@@ -54,6 +56,7 @@ export function createSubscriptionSupervisor<EventType>(options: {
   let current: SubscriptionCloser | null = null;
   let reconnectTimer: TimerHandle | null = null;
   let connectionTimer: TimerHandle | null = null;
+  let stabilityTimer: TimerHandle | null = null;
   let health: SubscriptionHealth = {
     state: "connecting",
     generation: 0,
@@ -68,7 +71,13 @@ export function createSubscriptionSupervisor<EventType>(options: {
 
   const publishState = () => options.onStateChange?.({ ...health });
 
-  const markHealthy = (kind: "event" | "eose") => {
+  const cancelStabilityTimer = () => {
+    if (stabilityTimer === null) return;
+    cancel(stabilityTimer);
+    stabilityTimer = null;
+  };
+
+  const markHealthy = (token: number, kind: "event" | "eose") => {
     if (connectionTimer) {
       cancel(connectionTimer);
       connectionTimer = null;
@@ -77,7 +86,6 @@ export function createSubscriptionSupervisor<EventType>(options: {
     health = {
       ...health,
       state: "healthy",
-      reconnectAttempts: 0,
       nextReconnectAt: null,
       lastConnectedAt: timestamp,
       lastEventAt: kind === "event" ? timestamp : health.lastEventAt,
@@ -85,6 +93,18 @@ export function createSubscriptionSupervisor<EventType>(options: {
       lastError: null,
     };
     publishState();
+    // EOSE can be followed immediately by an authenticated relay rejection.
+    // Preserve the accumulated retry attempt until this exact subscription has
+    // remained healthy for a meaningful interval, otherwise that close loop
+    // retries forever at the base delay.
+    if (stabilityTimer === null && health.reconnectAttempts > 0) {
+      stabilityTimer = schedule(() => {
+        stabilityTimer = null;
+        if (stopped || token !== callbackToken || health.state !== "healthy") return;
+        health = { ...health, reconnectAttempts: 0 };
+        publishState();
+      }, stabilityResetMs);
+    }
   };
 
   const scheduleReconnect = () => {
@@ -114,6 +134,7 @@ export function createSubscriptionSupervisor<EventType>(options: {
       cancel(connectionTimer);
       connectionTimer = null;
     }
+    cancelStabilityTimer();
     callbackToken += 1;
     current = null;
     const normalizedReasons = reasons.filter(Boolean);
@@ -148,12 +169,12 @@ export function createSubscriptionSupervisor<EventType>(options: {
       const next = options.subscribe({
         onevent: (event) => {
           if (stopped || token !== callbackToken) return;
-          markHealthy("event");
+          markHealthy(token, "event");
           options.onEvent(event, health.generation);
         },
         oneose: () => {
           if (stopped || token !== callbackToken) return;
-          markHealthy("eose");
+          markHealthy(token, "eose");
           options.onEose?.(health.generation);
         },
         onclose: (reasons) => handleClose(token, reasons),
@@ -184,6 +205,7 @@ export function createSubscriptionSupervisor<EventType>(options: {
         cancel(connectionTimer);
         connectionTimer = null;
       }
+      cancelStabilityTimer();
       current?.close("closed by caller");
       current = null;
       health = { ...health, state: "stopped", nextReconnectAt: null };
