@@ -1,7 +1,7 @@
 // Nostr plugin module implements nostr state store behavior.
 import { getNostrRuntime } from "./runtime.js";
 import { normalizeNostrStateAccountId } from "./state-account-id.js";
-import { readTextFileIfExists, writeJsonFileSecure } from "openclaw/plugin-sdk/security-runtime";
+import { privateFileStoreSync } from "openclaw/plugin-sdk/security-runtime";
 import path from "node:path";
 import type { PersistedClaimedId } from "./claimed-id-tracker.js";
 
@@ -41,7 +41,8 @@ function resolveStorePath(namespace: string, accountId: string, env?: NodeJS.Pro
 }
 
 function readStateFile<T>(namespace: string, accountId: string, env?: NodeJS.ProcessEnv): T | null {
-  const raw = readTextFileIfExists(resolveStorePath(namespace, accountId, env));
+  const file = resolveStorePath(namespace, accountId, env);
+  const raw = privateFileStoreSync(path.dirname(file)).readTextIfExists(path.basename(file));
   if (raw === null) {
     return null;
   }
@@ -58,7 +59,10 @@ function writeStateFile<T>(
   payload: T,
   env?: NodeJS.ProcessEnv,
 ): void {
-  writeJsonFileSecure(resolveStorePath(namespace, accountId, env), payload);
+  const file = resolveStorePath(namespace, accountId, env);
+  privateFileStoreSync(path.dirname(file)).writeJson(path.basename(file), payload, {
+    trailingNewline: true,
+  });
 }
 
 export async function readNostrBusState(params: {
