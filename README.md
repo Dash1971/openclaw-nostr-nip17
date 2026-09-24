@@ -24,7 +24,7 @@ This package currently uses the same `nostr` channel ID as the official plugin, 
 ```bash
 openclaw plugins install https://github.com/Dash1971/openclaw-nostr-nip17
 openclaw plugins disable nostr
-openclaw plugins enable nostr-nip17
+openclaw plugins enable nostr
 ```
 
 Configure `channels.nostr` as documented by OpenClaw. Keep the private key in an environment variable or OpenClaw SecretRef; never commit it.

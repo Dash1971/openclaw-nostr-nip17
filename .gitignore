@@ -3,3 +3,14 @@ dist/
 coverage/
 *.log
 .DS_Store
+
+# Keep deployment secrets and private operator material out of public commits.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+private/
+operator-notes/

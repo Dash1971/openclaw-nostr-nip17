@@ -141,8 +141,12 @@ export const nostrPlugin: ChannelPlugin<ResolvedNostrAccount> = createChatChanne
       },
       targetResolver: {
         looksLikeId: (input) => {
-          const trimmed = input.trim();
-          return trimmed.startsWith("npub1") || /^[0-9a-fA-F]{64}$/.test(trimmed);
+          try {
+            normalizePubkey(input);
+            return true;
+          } catch {
+            return false;
+          }
         },
         hint: "<npub|hex pubkey|nostr:npub...>",
       },

@@ -1,6 +1,5 @@
 // Nostr plugin module implements nostr bus behavior.
 import {
-  SimplePool,
   finalizeEvent,
   getPublicKey,
   verifyEvent,
@@ -8,6 +7,8 @@ import {
   type EventTemplate,
   type VerifiedEvent,
 } from "nostr-tools";
+import { AbstractSimplePool } from "nostr-tools/abstract-pool";
+import WebSocket from "ws";
 import {
   createDirectDmPreCryptoGuardPolicy,
   type DirectDmPreCryptoGuardPolicyOverrides,
@@ -32,6 +33,11 @@ import {
 } from "./nostr-state-store.js";
 import { createSeenTracker, type SeenTracker } from "./seen-tracker.js";
 import {
+  createSubscriptionSupervisor,
+  type SubscriptionHealth,
+} from "./subscription-supervisor.js";
+import { createClaimedIdTracker } from "./claimed-id-tracker.js";
+import {
   createNip17Message,
   NIP17_GIFT_WRAP_KIND,
   NIP17_INBOX_RELAYS_KIND,
@@ -45,8 +51,19 @@ import {
 
 const STARTUP_LOOKBACK_SEC = 2 * 24 * 60 * 60 + 300; // NIP-59 timestamps are randomized up to 2 days
 const MAX_PERSISTED_EVENT_IDS = 5000;
-const STATE_PERSIST_DEBOUNCE_MS = 5000; // Debounce state writes
+const STATE_PERSIST_INTERVAL_MS = 5000;
+const DEFAULT_REPLAY_RETENTION_MS = (STARTUP_LOOKBACK_SEC + 300) * 1000;
+const DEFAULT_SHUTDOWN_DRAIN_MS = 4000;
+const SUBSCRIPTION_HEALTH_TIMEOUT_MS = 30_000;
+const TRANSPORT_EOSE_TIMEOUT_MS = 60_000;
 const DEFAULT_INBOUND_GUARD_POLICY = createDirectDmPreCryptoGuardPolicy();
+
+export function computeReplaySinceTimestamp(caughtUpAt: number): number {
+  // A newly produced NIP-59 gift wrap may be backdated by up to two days.
+  // Anchor the overlap to the last completed relay catch-up, not wall clock:
+  // advancing during an outage would silently skip unread backdated messages.
+  return Math.max(0, caughtUpAt - STARTUP_LOOKBACK_SEC);
+}
 
 // Circuit breaker configuration
 const CIRCUIT_BREAKER_THRESHOLD = 5; // failures before opening
@@ -55,29 +72,190 @@ const CIRCUIT_BREAKER_RESET_MS = 30000; // 30 seconds before half-open
 // Health tracker configuration
 const HEALTH_WINDOW_MS = 60000; // 1 minute window for health stats
 
+export interface NostrBusHealth {
+  state: "connecting" | "healthy" | "degraded" | "unhealthy" | "stopped";
+  connectedRelays: number;
+  totalRelays: number;
+  reconnectAttempts: number;
+  lastConnectedAt: number | null;
+  lastDisconnectedAt: number | null;
+  lastEventAt: number | null;
+  lastEoseAt: number | null;
+  lastError: string | null;
+  relays: Record<string, SubscriptionHealth>;
+}
+
+export function aggregateSubscriptionHealth(
+  relays: string[],
+  relayHealth: ReadonlyMap<string, SubscriptionHealth>,
+): NostrBusHealth {
+  const states = relays.map((relay) => relayHealth.get(relay)).filter(Boolean) as SubscriptionHealth[];
+  const connectedRelays = states.filter((health) => health.state === "healthy").length;
+  const stoppedRelays = states.filter((health) => health.state === "stopped").length;
+  const state: NostrBusHealth["state"] =
+    stoppedRelays === relays.length
+      ? "stopped"
+      : connectedRelays === relays.length
+        ? "healthy"
+        : connectedRelays > 0
+          ? "degraded"
+          : states.some((health) => health.state === "degraded")
+            ? "unhealthy"
+            : "connecting";
+  const latest = (field: keyof SubscriptionHealth): number | null => {
+    const values = states
+      .map((health) => health[field])
+      .filter((value): value is number => typeof value === "number");
+    return values.length ? Math.max(...values) : null;
+  };
+  return {
+    state,
+    connectedRelays,
+    totalRelays: relays.length,
+    reconnectAttempts: states.reduce((sum, health) => sum + health.reconnectAttempts, 0),
+    lastConnectedAt: latest("lastConnectedAt"),
+    lastDisconnectedAt: latest("lastDisconnectedAt"),
+    lastEventAt: latest("lastEventAt"),
+    lastEoseAt: latest("lastEoseAt"),
+    lastError:
+      states
+        .map((health) => health.lastError)
+        .filter((error): error is string => Boolean(error))
+        .join("; ") || null,
+    relays: Object.fromEntries(
+      relays.flatMap((relay) => {
+        const health = relayHealth.get(relay);
+        return health ? [[relay, { ...health }]] : [];
+      }),
+    ),
+  };
+}
+
 type RelayPublisher = {
   publish: (
     relays: string[],
     event: Event,
     params?: {
       onauth?: (event: EventTemplate) => Promise<VerifiedEvent>;
+      abort?: AbortSignal;
     },
   ) => Promise<string>[];
 };
+
+type WebSocketImplementation = new (address: string | URL) => WebSocket;
+
+function createLifecycleWebSocketImplementation(
+  sockets: Set<WebSocket>,
+  Base: WebSocketImplementation = WebSocket,
+) {
+  return class LifecycleWebSocket extends Base {
+    constructor(address: string | URL) {
+      super(address);
+      sockets.add(this);
+      this.addEventListener("close", () => sockets.delete(this), { once: true });
+    }
+  };
+}
+
+function closeTrackedSockets(sockets: Set<WebSocket>): void {
+  for (const socket of sockets) {
+    if (socket.readyState === WebSocket.CLOSED) continue;
+    try {
+      socket.terminate();
+    } catch {
+      try {
+        socket.close();
+      } catch {
+        // Best effort only after terminate/close both reject.
+      }
+    }
+  }
+  sockets.clear();
+}
+
+function assertLifecycleActive(abort?: AbortSignal): void {
+  if (abort?.aborted) throw new Error("Nostr bus lifecycle has ended");
+}
 
 export async function publishEventWithNip42Auth(
   pool: RelayPublisher,
   relay: string,
   event: Event,
   sk: Uint8Array,
+  abort?: AbortSignal,
 ): Promise<void> {
+  assertLifecycleActive(abort);
   const publishPromises = pool.publish([relay], event, {
     onauth: async (authEvent) => finalizeEvent(authEvent, sk),
+    abort,
   });
   if (publishPromises.length === 0) {
     throw new Error(`Failed to create publish promise for relay ${relay}`);
   }
-  await publishPromises[0];
+  const result = await publishPromises[0];
+  assertLifecycleActive(abort);
+  if (result.startsWith("connection failure:")) {
+    throw new Error(`Failed to connect to relay ${relay}: ${result}`);
+  }
+}
+
+export async function publishEventToAllRelays(
+  pool: RelayPublisher,
+  relays: string[],
+  event: Event,
+  sk: Uint8Array,
+  abort?: AbortSignal,
+): Promise<Array<{ relay: string; durationMs: number; error?: Error }>> {
+  return await Promise.all(
+    relays.map(async (relay) => {
+      const startedAt = Date.now();
+      try {
+        assertLifecycleActive(abort);
+        await publishEventWithNip42Auth(pool, relay, event, sk, abort);
+        return { relay, durationMs: Date.now() - startedAt };
+      } catch (error) {
+        return {
+          relay,
+          durationMs: Date.now() - startedAt,
+          error: error instanceof Error ? error : new Error(String(error)),
+        };
+      }
+    }),
+  );
+}
+
+async function queryLatestEvent(
+  pool: AbstractSimplePool,
+  relays: string[],
+  filter: Parameters<AbstractSimplePool["subscribeMany"]>[1],
+  abort?: AbortSignal,
+): Promise<Event | null> {
+  assertLifecycleActive(abort);
+  return await new Promise<Event | null>((resolve, reject) => {
+    let latest: Event | null = null;
+    let settled = false;
+    let closer: ReturnType<AbstractSimplePool["subscribeMany"]> | undefined;
+    const finish = (result: Event | null, error?: Error) => {
+      if (settled) return;
+      settled = true;
+      abort?.removeEventListener("abort", onAbort);
+      void closer?.close("inbox relay discovery complete");
+      if (error) reject(error);
+      else resolve(result);
+    };
+    const onAbort = () => finish(null, new Error("Nostr bus lifecycle has ended"));
+    abort?.addEventListener("abort", onAbort, { once: true });
+    closer = pool.subscribeMany(relays, { ...filter, limit: 1 }, {
+      onevent: (event) => {
+        if (!latest || event.created_at > latest.created_at) latest = event;
+      },
+      oneose: () => finish(latest),
+      onclose: () => finish(latest),
+      maxWait: 3_000,
+      abort,
+    });
+    if (abort?.aborted) onAbort();
+  });
 }
 
 // ============================================================================
@@ -115,10 +293,22 @@ interface NostrBusOptions {
   onEose?: (relay: string) => void;
   /** Called on each metric event (optional) */
   onMetric?: (event: MetricEvent) => void;
+  /** Called whenever listener health changes (optional) */
+  onHealth?: (health: NostrBusHealth) => void;
   /** Maximum entries in seen tracker (default: 100,000) */
   maxSeenEntries?: number;
-  /** Seen tracker TTL in ms (default: 1 hour) */
+  /** Seen tracker TTL in ms (default: complete NIP-59 subscription overlap) */
   seenTtlMs?: number;
+  /** Durable verified-rumor retention (never shorter than seenTtlMs) */
+  replayRetentionMs?: number;
+  /** Maximum delay before dirty state is flushed (default: 5 seconds) */
+  statePersistIntervalMs?: number;
+  /** Maximum graceful drain before handlers are fenced and resources close (default: 4 seconds) */
+  shutdownDrainMs?: number;
+  /** Clock override for deterministic replay-retention tests */
+  now?: () => number;
+  /** WebSocket implementation override for controlled transport tests */
+  websocketImplementation?: WebSocketImplementation;
 }
 
 type FixedWindowRateLimiter = {
@@ -179,13 +369,15 @@ function createFixedWindowRateLimiter(params: {
 
 export interface NostrBusHandle {
   /** Stop the bus and close relay connections */
-  close: () => void;
+  close: () => Promise<void>;
   /** Get the bot's public key */
   publicKey: string;
   /** Send a DM to a pubkey */
   sendDm: (toPubkey: string, text: string) => Promise<void>;
   /** Get current metrics snapshot */
   getMetrics: () => MetricsSnapshot;
+  /** Get the current listener health */
+  getHealth: () => NostrBusHealth;
   /** Publish a profile (kind:0) to all relays */
   publishProfile: (profile: NostrProfile) => Promise<ProfilePublishResult>;
   /** Get the last profile publish state */
@@ -390,12 +582,34 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
     onEose,
     onMetric,
     maxSeenEntries = 100_000,
-    seenTtlMs = 60 * 60 * 1000,
+    seenTtlMs = DEFAULT_REPLAY_RETENTION_MS,
   } = options;
+  const replayRetentionMs = Math.max(
+    seenTtlMs,
+    Math.floor(options.replayRetentionMs ?? DEFAULT_REPLAY_RETENTION_MS),
+  );
+  const statePersistIntervalMs = Math.max(
+    1,
+    Math.floor(options.statePersistIntervalMs ?? STATE_PERSIST_INTERVAL_MS),
+  );
+  const shutdownDrainMs = Math.max(
+    1,
+    Math.floor(options.shutdownDrainMs ?? DEFAULT_SHUTDOWN_DRAIN_MS),
+  );
 
   const sk = validatePrivateKey(privateKey);
   const pk = getPublicKey(sk);
-  const pool = new SimplePool();
+  const trackedSockets = new Set<WebSocket>();
+  const pool = new AbstractSimplePool({
+    verifyEvent,
+    websocketImplementation: createLifecycleWebSocketImplementation(
+      trackedSockets,
+      options.websocketImplementation,
+    ) as unknown as typeof globalThis.WebSocket,
+    maxWaitForConnection: 3_000,
+    enablePing: true,
+    enableReconnect: false,
+  });
   const accountId = options.accountId ?? pk.slice(0, 16);
   const gatewayStartedAt = Math.floor(Date.now() / 1000);
   const guardPolicy = createDirectDmPreCryptoGuardPolicy({
@@ -409,11 +623,19 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
 
   // Initialize metrics
   const metrics = onMetric ? createMetrics(onMetric) : createNoopMetrics();
+  let caughtUpAt = gatewayStartedAt;
 
   // Initialize seen tracker with LRU
   const seen: SeenTracker = createSeenTracker({
     maxEntries: maxSeenEntries,
     ttlMs: seenTtlMs,
+  });
+  const rumors = createClaimedIdTracker({
+    maxEntries: maxSeenEntries,
+    ttlMs: seenTtlMs,
+    retentionMs: replayRetentionMs,
+    now: options.now,
+    protectedSince: () => computeReplaySinceTimestamp(caughtUpAt),
   });
 
   // Initialize circuit breakers and health tracker
@@ -426,12 +648,19 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
 
   // Read persisted state and compute `since` timestamp (with small overlap)
   const state = await readNostrBusState({ accountId });
-  const baseSince = computeSinceTimestamp(state, gatewayStartedAt);
-  const since = Math.max(0, baseSince - STARTUP_LOOKBACK_SEC);
-
+  caughtUpAt =
+    state?.caughtUpAt ??
+    state?.gatewayStartedAt ??
+    state?.lastProcessedAt ??
+    gatewayStartedAt;
   // Seed in-memory dedupe with recent IDs from disk (prevents restart replay)
   if (state?.recentEventIds?.length) {
     seen.seed(state.recentEventIds);
+  }
+  if (state?.processedRumorIds?.length) {
+    rumors.seedPersisted(state.processedRumorIds);
+  } else if (state?.recentRumorIds?.length) {
+    rumors.seed(state.recentRumorIds);
   }
 
   // Persist startup timestamp
@@ -439,35 +668,78 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
     accountId,
     lastProcessedAt: state?.lastProcessedAt ?? gatewayStartedAt,
     gatewayStartedAt,
+    caughtUpAt,
     recentEventIds: state?.recentEventIds ?? [],
+    recentRumorIds: state?.recentRumorIds ?? [],
+    processedRumorIds: rumors.snapshotPersisted(),
   });
 
-  // Debounced state persistence
+  // Bounded state persistence. Once dirty, the first timer is retained so
+  // continuous traffic cannot postpone the write indefinitely.
   let pendingWrite: ReturnType<typeof setTimeout> | undefined;
+  let pendingPersist: Promise<void> | null = null;
   let lastProcessedAt = state?.lastProcessedAt ?? gatewayStartedAt;
   let recentEventIds = (state?.recentEventIds ?? []).slice(-MAX_PERSISTED_EVENT_IDS);
+  let recentRumorIds = (state?.recentRumorIds ?? []).slice(-MAX_PERSISTED_EVENT_IDS);
 
-  function scheduleStatePersist(eventCreatedAt: number, eventId: string): void {
+  const persistState = (): Promise<void> =>
+    writeNostrBusState({
+      accountId,
+      lastProcessedAt,
+      gatewayStartedAt,
+      caughtUpAt,
+      recentEventIds,
+      recentRumorIds,
+      processedRumorIds: rumors.snapshotPersisted(),
+    }).catch((err: unknown) => onError?.(err as Error, "persist state"));
+
+  function scheduleStatePersist(): void {
+    if (lifecycleClosed || pendingWrite) return;
+    pendingWrite = setTimeout(() => {
+      pendingWrite = undefined;
+      const operation = persistState();
+      pendingPersist = operation;
+      void operation.finally(() => {
+        if (pendingPersist === operation) pendingPersist = null;
+      });
+    }, statePersistIntervalMs);
+  }
+
+  function recordProcessedEvent(eventCreatedAt: number, eventId: string, rumorId?: string): void {
+    if (lifecycleClosed) return;
     lastProcessedAt = Math.max(lastProcessedAt, eventCreatedAt);
     recentEventIds.push(eventId);
     if (recentEventIds.length > MAX_PERSISTED_EVENT_IDS) {
       recentEventIds = recentEventIds.slice(-MAX_PERSISTED_EVENT_IDS);
     }
-
-    if (pendingWrite) {
-      clearTimeout(pendingWrite);
+    if (rumorId) {
+      if (!recentRumorIds.includes(rumorId)) recentRumorIds.push(rumorId);
+      if (recentRumorIds.length > MAX_PERSISTED_EVENT_IDS) {
+        recentRumorIds = recentRumorIds.slice(-MAX_PERSISTED_EVENT_IDS);
+      }
     }
-    pendingWrite = setTimeout(() => {
-      writeNostrBusState({
-        accountId,
-        lastProcessedAt,
-        gatewayStartedAt,
-        recentEventIds,
-      }).catch((err: unknown) => onError?.(err as Error, "persist state"));
-    }, STATE_PERSIST_DEBOUNCE_MS);
+    scheduleStatePersist();
   }
 
   const inflight = new Set<string>();
+  const retryableEventIds = new Set<string>();
+  const activeOperations = new Set<Promise<unknown>>();
+  let closing = false;
+  let lifecycleClosed = false;
+  const lifecycleAbort = new AbortController();
+  let closePromise: Promise<void> | null = null;
+  const trackOperation = <T>(operation: () => Promise<T>): Promise<T> => {
+    if (closing) {
+      return Promise.reject(new Error("Nostr bus is closing"));
+    }
+    const promise = operation();
+    activeOperations.add(promise);
+    void promise.then(
+      () => activeOperations.delete(promise),
+      () => activeOperations.delete(promise),
+    );
+    return promise;
+  };
   const perSenderRateLimiter = createFixedWindowRateLimiter({
     windowMs: guardPolicy.rateLimit.windowMs,
     maxRequests: guardPolicy.rateLimit.maxPerSenderPerWindow,
@@ -488,6 +760,8 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
 
   // Event handler
   async function handleEvent(event: Event): Promise<void> {
+    let claimedRumorId: string | null = null;
+    let ownsEventClaim = false;
     try {
       metrics.emit("event.received");
 
@@ -497,8 +771,10 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
         return;
       }
       inflight.add(event.id);
+      ownsEventClaim = true;
 
       const markSeen = () => {
+        retryableEventIds.delete(event.id);
         seen.add(event.id);
         metrics.emit("memory.seen_tracker_size", seen.size());
       };
@@ -508,16 +784,18 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
       };
       const rejectVerifiedAndPersist = (metric: Parameters<typeof metrics.emit>[0]) => {
         rejectAndMarkSeen(metric);
-        scheduleStatePersist(event.created_at, event.id);
+        recordProcessedEvent(event.created_at, event.id);
       };
 
       // Skip events older than our `since` (relay may ignore filter)
+      const since = computeReplaySinceTimestamp(caughtUpAt);
       if (event.created_at < since) {
         rejectAndMarkSeen("event.rejected.stale");
         return;
       }
 
       if (event.created_at > Math.floor(Date.now() / 1000) + guardPolicy.maxFutureSkewSec) {
+        retryableEventIds.add(event.id);
         metrics.emit("event.rejected.future");
         return;
       }
@@ -566,6 +844,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
 
       if (Buffer.byteLength(event.content, "utf8") > guardPolicy.maxCiphertextBytes) {
         if (rejectIfGlobalRateLimited()) {
+          retryableEventIds.add(event.id);
           return;
         }
         rejectAndMarkSeen("event.rejected.oversized_ciphertext");
@@ -573,6 +852,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
       }
 
       if (rejectIfGlobalRateLimited()) {
+        retryableEventIds.add(event.id);
         return;
       }
 
@@ -594,17 +874,44 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
         return;
       }
 
+      const rumorClaim = rumors.claim(message.rumorId, event.created_at);
+      if (rumorClaim === "inflight") {
+        metrics.emit("event.duplicate");
+        return;
+      }
+      if (rumorClaim === "processed") {
+        markSeen();
+        recordProcessedEvent(event.created_at, event.id, message.rumorId);
+        metrics.emit("event.duplicate");
+        return;
+      }
+      claimedRumorId = message.rumorId;
+
+      const markRumorProcessed = () => {
+        if (!claimedRumorId) return;
+        rumors.complete(claimedRumorId, event.created_at);
+        metrics.emit("memory.seen_tracker_size", seen.size() + rumors.size());
+        claimedRumorId = null;
+      };
+      const markMessageProcessed = () => {
+        if (lifecycleClosed) return;
+        markSeen();
+        markRumorProcessed();
+        recordProcessedEvent(event.created_at, event.id, message.rumorId);
+      };
+
       if (message.senderPubkey === pk) {
-        rejectVerifiedAndPersist("event.rejected.self_message");
+        markMessageProcessed();
+        metrics.emit("event.rejected.self_message");
         return;
       }
       if (rejectIfVerifiedSenderRateLimited(message.senderPubkey)) {
-        markSeen();
-        scheduleStatePersist(event.created_at, event.id);
+        retryableEventIds.add(event.id);
         return;
       }
 
       const replyTo = async (text: string): Promise<void> => {
+        if (lifecycleClosed) throw new Error("Nostr bus lifecycle has ended");
         await sendEncryptedDm(
           pool,
           sk,
@@ -616,6 +923,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
           healthTracker,
           onError,
           message.rumorId,
+          lifecycleAbort.signal,
         );
       };
 
@@ -624,17 +932,16 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
           senderPubkey: message.senderPubkey,
           reply: replyTo,
         });
+        if (lifecycleClosed) return;
         if (decision !== "allow") {
-          markSeen();
-          scheduleStatePersist(event.created_at, event.id);
+          markMessageProcessed();
           return;
         }
       }
 
       if (Buffer.byteLength(message.content, "utf8") > guardPolicy.maxPlaintextBytes) {
-        markSeen();
+        markMessageProcessed();
         metrics.emit("event.rejected.oversized_plaintext");
-        scheduleStatePersist(event.created_at, event.id);
         return;
       }
 
@@ -643,19 +950,25 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
         eventId: message.rumorId,
         createdAt: message.createdAt,
       });
+      if (lifecycleClosed) return;
 
       // Only cache successful deliveries so handler failures can retry.
-      markSeen();
+      markMessageProcessed();
 
       // Mark as processed
       metrics.emit("event.processed");
 
       // Persist progress (debounced)
-      scheduleStatePersist(event.created_at, event.id);
     } catch (err) {
+      if (!lifecycleClosed) retryableEventIds.add(event.id);
       onError?.(err as Error, `event ${event.id}`);
     } finally {
-      inflight.delete(event.id);
+      if (claimedRumorId) {
+        rumors.release(claimedRumorId);
+      }
+      if (ownsEventClaim) {
+        inflight.delete(event.id);
+      }
     }
   }
 
@@ -672,74 +985,198 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
     relays.map((relay) => publishEventWithNip42Auth(pool, relay, inboxRelayEvent, sk)),
   );
 
-  const dmFilter = { kinds: [NIP17_GIFT_WRAP_KIND], "#p": [pk], since } satisfies Parameters<
-    typeof pool.subscribeMany
-  >[1];
-  const relayAbort = new AbortController();
-  const sub = pool.subscribeMany(relays, dmFilter, {
-    onevent: (event) => {
-      void handleEvent(event);
-    },
-    oneose: () => {
-      // EOSE handler - called when all stored events have been received
-      for (const relay of relays) {
+  const buildDmFilter = () =>
+    ({
+      kinds: [NIP17_GIFT_WRAP_KIND],
+      "#p": [pk],
+      since: computeReplaySinceTimestamp(caughtUpAt),
+    }) satisfies Parameters<typeof pool.subscribeMany>[1];
+  const relayHealth = new Map<string, SubscriptionHealth>();
+  type RelayCatchUpGeneration = {
+    generation: number;
+    candidate: number;
+    transportEoseDeadlineAt: number;
+    eose: boolean;
+    pending: Set<Promise<unknown>>;
+  };
+  const relayCatchUp = new Map<string, RelayCatchUpGeneration>();
+  // A reconnect replaces the relay's transport generation, but handlers that
+  // began under the retired generation still own delivery obligations. Keep
+  // those operations in the checkpoint barrier until their actual outcome is
+  // known; a duplicate observed by the replacement generation is not proof of
+  // successful delivery.
+  const retiredCatchUpPending = new Set<Promise<unknown>>();
+  const retainRetiredCatchUpOperation = (operation: Promise<unknown>) => {
+    if (retiredCatchUpPending.has(operation)) return;
+    retiredCatchUpPending.add(operation);
+    void operation.then(
+      () => {
+        retiredCatchUpPending.delete(operation);
+        tryAdvanceCatchUpCheckpoint();
+      },
+      () => {
+        retiredCatchUpPending.delete(operation);
+        tryAdvanceCatchUpCheckpoint();
+      },
+    );
+  };
+  const publishAggregateHealth = () => options.onHealth?.(aggregateSubscriptionHealth(relays, relayHealth));
+  const tryAdvanceCatchUpCheckpoint = () => {
+    if (
+      closing ||
+      lifecycleClosed ||
+      retryableEventIds.size > 0 ||
+      retiredCatchUpPending.size > 0
+    ) {
+      return;
+    }
+    const current = relays.flatMap((relay) => {
+      const health = relayHealth.get(relay);
+      const catchUp = relayCatchUp.get(relay);
+      return health && catchUp ? [{ health, catchUp }] : [];
+    });
+    if (
+      current.length !== relays.length ||
+      current.some(
+        ({ health, catchUp }) =>
+          health.state !== "healthy" ||
+          catchUp.generation !== health.generation ||
+          !catchUp.eose ||
+          catchUp.pending.size > 0,
+      )
+    ) {
+      return;
+    }
+    const commonCandidate = Math.min(...current.map(({ catchUp }) => catchUp.candidate));
+    caughtUpAt = Math.max(caughtUpAt, commonCandidate);
+    scheduleStatePersist();
+  };
+  const subscriptions = relays.map((relay) =>
+    createSubscriptionSupervisor<Event>({
+      subscribe: (callbacks) => {
+        const generation = relayHealth.get(relay)?.generation ?? 0;
+        relayCatchUp.set(relay, {
+          generation,
+          candidate: Math.floor(Date.now() / 1000),
+          transportEoseDeadlineAt: Date.now() + TRANSPORT_EOSE_TIMEOUT_MS,
+          eose: false,
+          pending: new Set(),
+        });
+        return pool.subscribeMany([relay], buildDmFilter(), {
+          ...callbacks,
+          maxWait: TRANSPORT_EOSE_TIMEOUT_MS,
+          onauth: async (authEvent) => finalizeEvent(authEvent, sk),
+        });
+      },
+      onEvent: (event, generation) => {
+        const operation = trackOperation(() => handleEvent(event));
+        const catchUp = relayCatchUp.get(relay);
+        // EOSE certifies backlog transmission, not completion of future live
+        // deliveries. Track every inbound operation so a reconnect can retain
+        // any unfinished work that its new checkpoint candidate could skip.
+        if (catchUp?.generation === generation) {
+          catchUp.pending.add(operation);
+          void operation.finally(() => {
+            catchUp.pending.delete(operation);
+            tryAdvanceCatchUpCheckpoint();
+          });
+        }
+        void operation.catch((error: unknown) => {
+          if (!closing) onError?.(error as Error, `event ${event.id}`);
+        });
+      },
+      onEose: (generation) => {
+        const target = relayCatchUp.get(relay);
+        // nostr-tools invokes oneose for both wire EOSE and its local timeout.
+        // A callback at/after the configured deadline is not evidence that the
+        // relay completed backlog delivery and must never advance caughtUpAt.
+        if (
+          !target ||
+          target.generation !== generation ||
+          Date.now() >= target.transportEoseDeadlineAt
+        ) {
+          return;
+        }
+        target.eose = true;
         metrics.emit("relay.message.eose", 1, { relay });
-      }
-      onEose?.(relays.join(", "));
-    },
-    onclose: (reason) => {
-      // Handle subscription close
-      for (const relay of relays) {
+        metrics.emit("relay.connect", 1, { relay });
+        options.onConnect?.(relay);
+        onEose?.(relay);
+        tryAdvanceCatchUpCheckpoint();
+      },
+      onClose: (reasons) => {
         metrics.emit("relay.message.closed", 1, { relay });
+        metrics.emit("relay.disconnect", 1, { relay });
         options.onDisconnect?.(relay);
-      }
-      onError?.(new Error(`Subscription closed: ${reason.join(", ")}`), "subscription");
-    },
-    abort: relayAbort.signal,
-  });
+        onError?.(new Error(`Subscription closed: ${reasons.join(", ")}`), `subscription ${relay}`);
+      },
+      onReconnectAttempt: () => {
+        metrics.emit("relay.reconnect", 1, { relay });
+      },
+      onStateChange: (health) => {
+        relayHealth.set(relay, health);
+        const retired = relayCatchUp.get(relay);
+        if (retired && retired.generation !== health.generation) {
+          for (const operation of retired.pending) {
+            retainRetiredCatchUpOperation(operation);
+          }
+          relayCatchUp.delete(relay);
+        }
+        publishAggregateHealth();
+      },
+      connectionTimeoutMs: SUBSCRIPTION_HEALTH_TIMEOUT_MS,
+    }),
+  );
 
   // Public sendDm function
   const sendDm = async (toPubkey: string, text: string): Promise<void> => {
-    await sendEncryptedDm(
-      pool,
-      sk,
-      toPubkey,
-      text,
-      relays,
-      metrics,
-      circuitBreakers,
-      healthTracker,
-      onError,
+    await trackOperation(() =>
+      sendEncryptedDm(
+        pool,
+        sk,
+        toPubkey,
+        text,
+        relays,
+        metrics,
+        circuitBreakers,
+        healthTracker,
+        onError,
+        undefined,
+        lifecycleAbort.signal,
+      ),
     );
   };
 
   // Profile publishing function
   const publishProfile = async (profile: NostrProfile): Promise<ProfilePublishResult> => {
-    // Read last published timestamp for monotonic ordering
-    const profileState = await readNostrProfileState({ accountId });
-    const lastPublishedAt = profileState?.lastPublishedAt ?? undefined;
+    return await trackOperation(async () => {
+      // Read last published timestamp for monotonic ordering
+      const profileState = await readNostrProfileState({ accountId });
+      const lastPublishedAt = profileState?.lastPublishedAt ?? undefined;
 
-    // Publish the profile
-    const result = await publishProfileFn(pool, sk, relays, profile, lastPublishedAt);
+      // Publish the profile
+      const result = await publishProfileFn(pool, sk, relays, profile, lastPublishedAt);
+      if (lifecycleClosed) throw new Error("Nostr bus lifecycle has ended");
 
-    // Convert results to state format
-    const publishResults: Record<string, "ok" | "failed" | "timeout"> = {};
-    for (const relay of result.successes) {
-      publishResults[relay] = "ok";
-    }
-    for (const { relay, error } of result.failures) {
-      publishResults[relay] = error === "timeout" ? "timeout" : "failed";
-    }
+      // Convert results to state format
+      const publishResults: Record<string, "ok" | "failed" | "timeout"> = {};
+      for (const relay of result.successes) {
+        publishResults[relay] = "ok";
+      }
+      for (const { relay, error } of result.failures) {
+        publishResults[relay] = error === "timeout" ? "timeout" : "failed";
+      }
 
-    // Persist the publish state
-    await writeNostrProfileState({
-      accountId,
-      lastPublishedAt: result.createdAt,
-      lastPublishedEventId: result.eventId,
-      lastPublishResults: publishResults,
+      // Persist the publish state
+      await writeNostrProfileState({
+        accountId,
+        lastPublishedAt: result.createdAt,
+        lastPublishedEventId: result.eventId,
+        lastPublishResults: publishResults,
+      });
+
+      return result;
     });
-
-    return result;
   };
 
   // Get profile state function
@@ -754,29 +1191,45 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
 
   return {
     close: () => {
-      relayAbort.abort("closed by caller");
-      void Promise.resolve(sub.close("closed by caller"))
-        .catch((err: unknown) => onError?.(err as Error, "close subscription"))
-        .finally(() => {
-          pool.close(relays);
-        });
-      seen.stop();
-      perSenderRateLimiter.clear();
-      globalRateLimiter.clear();
-      // Flush pending state write synchronously on close
-      if (pendingWrite) {
-        clearTimeout(pendingWrite);
-        writeNostrBusState({
-          accountId,
-          lastProcessedAt,
-          gatewayStartedAt,
-          recentEventIds,
-        }).catch((err: unknown) => onError?.(err as Error, "persist state on close"));
-      }
+      if (closePromise) return closePromise;
+      closing = true;
+      // Stop in-progress discovery/connect/publication work immediately. Message
+      // handlers may still finish inside the bounded drain, but shutdown must
+      // never allow them to open new transport work.
+      lifecycleAbort.abort();
+      closePromise = (async () => {
+        for (const subscription of subscriptions) subscription.stop();
+        if (pendingWrite) {
+          clearTimeout(pendingWrite);
+          pendingWrite = undefined;
+        }
+        const drain = Promise.allSettled([...activeOperations]);
+        let drainTimer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          drain,
+          new Promise<void>((resolve) => {
+            drainTimer = setTimeout(resolve, shutdownDrainMs);
+          }),
+        ]);
+        if (drainTimer) clearTimeout(drainTimer);
+        lifecycleClosed = true;
+        if (pendingPersist) {
+          await pendingPersist;
+        }
+        await persistState();
+        pool.destroy();
+        closeTrackedSockets(trackedSockets);
+        seen.stop();
+        rumors.stop();
+        perSenderRateLimiter.clear();
+        globalRateLimiter.clear();
+      })();
+      return closePromise;
     },
     publicKey: pk,
     sendDm,
     getMetrics: () => metrics.getSnapshot(),
+    getHealth: () => aggregateSubscriptionHealth(relays, relayHealth),
     publishProfile,
     getProfileState,
   };
@@ -790,7 +1243,7 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
  * Send an encrypted DM to a pubkey
  */
 async function sendEncryptedDm(
-  pool: SimplePool,
+  pool: AbstractSimplePool,
   sk: Uint8Array,
   toPubkey: string,
   text: string,
@@ -800,22 +1253,28 @@ async function sendEncryptedDm(
   healthTracker: RelayHealthTracker,
   onError?: (error: Error, context: string) => void,
   replyToEventId?: string,
+  abort?: AbortSignal,
 ): Promise<void> {
-  const inboxEvent = await pool.get(relays, {
+  const inboxEvent = await queryLatestEvent(pool, relays, {
     kinds: [NIP17_INBOX_RELAYS_KIND],
     authors: [toPubkey],
-  });
+  }, abort);
+  assertLifecycleActive(abort);
   const inboxRelays = readInboxRelays(inboxEvent);
   if (inboxRelays.length === 0) {
     throw new Error(`Recipient ${toPubkey} has not published NIP-17 inbox relays (kind 10050)`);
   }
   const reply = createNip17Message(sk, toPubkey, text, replyToEventId);
+  assertLifecycleActive(abort);
 
   // Sort relays by health score (best first)
   const sortedRelays = healthTracker.getSortedRelays(inboxRelays);
 
-  // Try relays in order of health, respecting circuit breakers
+  // Replicate to every healthy advertised inbox relay. A single accepted
+  // publish is enough for success, but writing to all of them prevents a
+  // client from missing replies when it is temporarily reading only one.
   let lastError: Error | undefined;
+  const eligibleRelays: string[] = [];
   for (const relay of sortedRelays) {
     let cb = circuitBreakers.get(relay);
     if (!cb) {
@@ -827,29 +1286,29 @@ async function sendEncryptedDm(
     if (cb && !cb.canAttempt()) {
       continue;
     }
-
-    const startTime = Date.now();
-    try {
-      await publishEventWithNip42Auth(pool, relay, reply, sk);
-      const latency = Date.now() - startTime;
-
-      // Record success
-      cb?.recordSuccess();
-      healthTracker.recordSuccess(relay, latency);
-
-      return; // Success - exit early
-    } catch (err) {
-      lastError = err as Error;
-      const latency = Date.now() - startTime;
-
-      // Record failure
-      cb?.recordFailure();
-      healthTracker.recordFailure(relay);
-      metrics.emit("relay.error", 1, { relay, latency });
-
-      onError?.(lastError, `publish to ${relay}`);
-    }
+    eligibleRelays.push(relay);
   }
 
-  throw new Error(`Failed to publish to any relay: ${lastError?.message}`);
+  assertLifecycleActive(abort);
+  const results = await publishEventToAllRelays(pool, eligibleRelays, reply, sk, abort);
+  let successes = 0;
+  for (const result of results) {
+    const cb = circuitBreakers.get(result.relay);
+    if (!result.error) {
+      successes += 1;
+      cb?.recordSuccess();
+      healthTracker.recordSuccess(result.relay, result.durationMs);
+      continue;
+    }
+    lastError = result.error;
+    cb?.recordFailure();
+    healthTracker.recordFailure(result.relay);
+    metrics.emit("relay.error", 1, { relay: result.relay, latency: result.durationMs });
+    onError?.(result.error, `publish to ${result.relay}`);
+  }
+  if (successes > 0) {
+    return;
+  }
+
+  throw new Error(`Failed to publish to any relay: ${lastError?.message ?? "no relay available"}`);
 }

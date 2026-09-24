@@ -64,7 +64,7 @@ export function isValidPubkey(input: string): boolean {
  * Normalize a pubkey to hex format (accepts npub or hex)
  */
 export function normalizePubkey(input: string): string {
-  const trimmed = input.trim();
+  const trimmed = input.trim().replace(/^nostr:/i, "");
 
   // npub format - decode to hex
   if (trimmed.startsWith("npub1")) {
