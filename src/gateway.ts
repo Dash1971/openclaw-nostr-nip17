@@ -16,6 +16,7 @@ import { resolveDefaultNostrAccountId, type ResolvedNostrAccount } from "./types
 import { createTotpAuthenticator } from "./totp-auth.js";
 import { buildNostrInboundAuthContext } from "./inbound-auth-context.js";
 import type { NostrBusHealth } from "./nostr-bus.js";
+import { getNostrBusRegistry } from "./bus-registry.js";
 
 type NostrGatewayStart = NonNullable<
   NonNullable<ChannelPlugin<ResolvedNostrAccount>["gateway"]>["startAccount"]
@@ -27,8 +28,7 @@ type NostrOutboundAdapter = Pick<
   sendText: NonNullable<ChannelOutboundAdapter["sendText"]>;
 };
 
-const activeBuses = new Map<string, NostrBusHandle>();
-const metricsSnapshots = new Map<string, MetricsSnapshot>();
+const { activeBuses, metricsSnapshots } = getNostrBusRegistry();
 const ACCESS_GROUP_PREFIX = "accessGroup:";
 
 export function buildNostrListenerStatus<
