@@ -1105,6 +1105,21 @@ export async function startNostrBus(options: NostrBusOptions): Promise<NostrBusH
         tryAdvanceCatchUpCheckpoint();
       },
       onClose: (reasons) => {
+        // Some relays prepend ERROR to the NIP-42 reason. nostr-tools only
+        // recognizes a bare auth-required prefix, so authenticate explicitly
+        // before the supervisor's retry without weakening the closed state.
+        if (!closing && reasons.some((reason) => /^ERROR:\s*auth-required:/i.test(reason))) {
+          void trackOperation(async () => {
+            const connection = await pool.ensureRelay(relay, { abort: lifecycleAbort.signal });
+            assertLifecycleActive(lifecycleAbort.signal);
+            await connection.auth(async (event) => {
+              assertLifecycleActive(lifecycleAbort.signal);
+              return finalizeEvent(event, sk);
+            });
+          }).catch((error: unknown) => {
+            if (!closing) onError?.(error as Error, `authenticate subscription ${relay}`);
+          });
+        }
         metrics.emit("relay.message.closed", 1, { relay });
         metrics.emit("relay.disconnect", 1, { relay });
         options.onDisconnect?.(relay);
